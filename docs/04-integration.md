@@ -14,6 +14,9 @@
 
 三个安装脚本都是**幂等**的（重跑只刷新文件、已打过的补丁会跳过）且都支持 `--revert`。
 
+已知能跑通的那一组上游 commit 记在 [UPSTREAM.md](../UPSTREAM.md) —— 补丁是 `-p0` diff，
+上游漂移是这套装法唯一的系统性风险，换版本前先看那里。
+
 ```bash
 GEM5_HOME=$HOME/gem5                     ./gem5int/install.sh
 VORTEX_HOME=$HOME/vortex-gpu/vortex      ./vortexint/install.sh
@@ -88,8 +91,24 @@ diff -u /tmp/orig.h core_mini_axi_wrapper.h > $PROJ/coralnpuint/patches/core_min
 ### gem5
 
 ```bash
-scons -C $GEM5_HOME build/X86/gem5.opt -j$(nproc)
+$GEM5_HOME/.venv/bin/scons -C $GEM5_HOME build/X86/gem5.opt -j$(nproc)
 ```
+
+**为什么写全路径**：gem5 自 v24 起把构建依赖装在树内的 `.venv/` 里（`pip install -r
+requirements.txt`），`scons` 通常**不在** `PATH` 上，直接敲 `scons` 得到的是
+command not found，或者更糟 —— 敲到系统里另一个版本的 scons 上。`.venv` 不存在时先建：
+
+```bash
+/usr/bin/python3 -m venv $GEM5_HOME/.venv
+$GEM5_HOME/.venv/bin/pip install -r $GEM5_HOME/requirements.txt
+```
+
+**Python 版本**：gem5 要求 3.8+，且 `gem5.opt` 会**链接**构建时那个解释器的
+`libpython`（本机是系统的 3.12，`ldd gem5.opt | grep python` 可查）。本项目自己的
+Python 工具（`hettrace`、`gen_addrmap.py`）只用标准库、3.8 就能跑，两边不必是同一个
+解释器 —— 但要注意 `python3` 指到哪：机器上若有无关的 venv 抢在 `PATH` 前面（本机
+`python3` 是一个 3.8 的 EDA venv），`python3 -m hettrace` 和 gem5 里跑的就不是同一个
+Python 了。工具本身不受影响，容易受影响的是"我以为我在用哪个 python"。
 
 编完之后核对一下东西是否真的进去了 —— 这比"编译通过"靠得住，因为漏装一个 `.py` 只会让
 参数消失，不会让编译失败：
@@ -135,11 +154,16 @@ make -C $VORTEX_HOME/third_party -j$(nproc)
 `libvortex-gem5.so`。
 
 ```bash
-mkdir -p /tmp/vxbuild && cd /tmp/vxbuild
+export VORTEX_BUILD=$(dirname $VORTEX_HOME)/vxbuild     # run_vortex.sh 的默认值
+mkdir -p $VORTEX_BUILD && cd $VORTEX_BUILD
 $VORTEX_HOME/configure --xlen=32
-make -C /tmp/vxbuild/sim/simx USE_GEM5=1 libvortex-gem5 -j$(nproc)
-nm -D --defined-only /tmp/vxbuild/sim/simx/libvortex-gem5.so | grep vortex_gem5_trace_
+make -C $VORTEX_BUILD/sim/simx USE_GEM5=1 libvortex-gem5 -j$(nproc)
+nm -D --defined-only $VORTEX_BUILD/sim/simx/libvortex-gem5.so | grep vortex_gem5_trace_
 ```
+
+**别把构建目录放在 `/tmp`**。Vortex 是 out-of-tree 构建，放哪都行，`/tmp` 看着很自然
+—— 但 Ubuntu 开机会清 `/tmp`，重启之后 `libvortex-gem5.so` 就没了。那时 `run_vortex.sh`
+报的是"找不到 .so"，完全看不出是被系统删的，而且重编一次要几分钟。
 
 最后那行是 tap 是否真的编进去了的判据，应看到三个符号：`vortex_gem5_trace_open` /
 `_close` / `_emitted`。
@@ -161,23 +185,68 @@ export LD_LIBRARY_PATH=$VORTEX_HOME/third_party/ramulator:$LD_LIBRARY_PATH
 
 `run_vortex.sh` 自己做了这件事并在做不到时给出明确的错误。
 
-### Vortex 的 RISC-V 工具链（可选，用于 `.vxbin`）
+### Vortex 的 RISC-V 工具链（`run_vortex_shared.sh` 需要）
 
-上面这套**不需要** RISC-V 工具链 —— `run_vortex.sh` 用的内核是手写的裸机 rv32im 平坦镜像
-（`workloads/vortex_smoke/kernel.S`），用系统自带的 multilib `riscv64-unknown-elf-gcc` 就
-能编，`vortex_gem5_load_kernel` 的 flat-image 路径接受 `.bin`。
+只跑 `run_vortex.sh`（单设备 tap 验收）**不需要** RISC-V 工具链 —— 它用的内核是手写的裸机
+rv32im 平坦镜像（`workloads/vortex_smoke/kernel.S`），用系统自带的 multilib
+`riscv64-unknown-elf-gcc` 就能编，`vortex_gem5_load_kernel` 的 flat-image 路径接受 `.bin`。
 
 但**只有** `.vxbin` 才能走 CP 驱动的启动路径，也就是 host ↔ Vortex 真正交换字节所必需的那
-条路（见 [03-limitations.md](03-limitations.md)）。要编 `.vxbin` 需要 Vortex 的 LLVM 工具
-链，装法是 Vortex 自己的：
+条路（见 [03-limitations.md](03-limitations.md)）。`run_vortex_shared.sh` 走的就是这条路，
+所以它需要 Vortex 的 LLVM 工具链，装法是 Vortex 自己的：
 
 ```bash
-cd $VORTEX_HOME
-./ci/toolchain_install.sh --all       # 下载 llvm-vortex / libc32 / libcrt32 到 $TOOLDIR
+mkdir -p /tmp/tc-dl && cd /tmp/tc-dl              # 脚本下载到 cwd，用个临时目录
+TOOLDIR=$HOME/tools $VORTEX_BUILD/ci/toolchain_install.sh --llvm --libc32 --libcrt32 --riscv32
 ```
 
-需要网络且体积不小。装好之后 `make -C /tmp/vxbuild/tests/kernel` 之类的目标会产出
-`.vxbin`，把它传给 `het_system.py` 的 `--vortex-kernel` 即可。
+几点：
+
+* 用**配置后**的 `$VORTEX_BUILD/ci/toolchain_install.sh`，不是源码树里的 `.sh.in`（那是
+  模板，`configure` 才会把 `@TOOLDIR@` 之类替换掉）。
+* 别用 `--all`：那会连 verilator / yosys / sta / pocl / chipstar / mesa 一起拉下来，本项目
+  一个都用不到。编 `.vxbin` 只要上面四样，约 1.6 GB。
+* `OSVERSION` 默认 `ubuntu/focal`，预编译产物在更新的发行版上照样能跑（glibc 向前兼容）。
+* 脚本对每个组件会先 `rm -rf $TOOLDIR/<组件>`，所以 `$TOOLDIR` 里若已有同名目录会被删掉。
+
+装好之后按 Vortex 自己的方式建 host runtime 与回归测试：
+
+```bash
+make -C $VORTEX_BUILD/sw/runtime                    # libvortex.so + libvortex-gem5-x86_64.so
+make -C $VORTEX_BUILD/tests/regression/vecadd       # vecadd + kernel.vxbin
+```
+
+这三个产物就是 `run_vortex_shared.sh` 要的全部东西（它会自己检查、缺哪个报哪个）。
+
+`.vxbin` 也可以直接喂给 `het_system.py` 的 `--vortex-kernel`，那走的是 standalone 预载路
+径 —— 没有 host 那条腿，等于 `run_vortex.sh` 的跑法。要验字节共享必须走 CP，也就是要有
+host runtime。
+
+## 配置脚本里的一个坑：`SystemExit("消息")`
+
+gem5 配置脚本是跑在 gem5 里的 Python，退出路径与普通 python3 不一样。
+`src/sim/main.cc` 捕获 `SystemExit` 之后做的是：
+
+```cpp
+if (e.matches(PyExc_SystemExit))
+    return e.value().attr("code").cast<int>();
+```
+
+`code` 是字符串就抛 `pybind11::cast_error`，进程 `terminate`，屏幕上只剩：
+
+```
+terminate called after throwing an instance of 'pybind11::cast_error'
+  what():  Unable to cast Python instance of type <class 'str'> to C++ type 'int'
+Program aborted at tick 0
+--- BEGIN LIBC BACKTRACE ---
+```
+
+**那条本该打出来的错误消息一个字都看不到**，而现象看着像 gem5 或某个设备库炸了 —— 本项目
+在三源负载上为此排查了一轮，真实原因只是 `--npu-kernel` 指的 `ddr_touch.elf` 路径不存在
+（`.elf` 和 `.so` 不在同一个 bazel-out 配置目录下，得 `find`，不能照着 `.so` 的路径拼）。
+
+所以本项目的三个配置脚本一律先 `print(..., file=sys.stderr)` 再 `raise SystemExit(1)`。
+`het_system.py` 里包成了 `die()`，注释就在那儿。往这些脚本里加检查时照这个写法。
 
 ## 跑测试
 
@@ -185,22 +254,31 @@ cd $VORTEX_HOME
 # host + CoralNPU 协同（含反向对照）—— 本项目的主验收
 GEM5_HOME=$HOME/gem5 CORALNPU_HOME=$HOME/coralnpu gem5int/tests/run_het.sh
 
+# host + Vortex 协同（走 CP，需要 .vxbin 与 host runtime，见上一节）
+GEM5_HOME=$HOME/gem5 VORTEX_HOME=$HOME/vortex-gpu/vortex \
+    gem5int/tests/run_vortex_shared.sh
+
+# 三源同时跑并归并（要上面两条腿的全部前置条件，外加自己的 host 负载，见下）
+VORTEX_HOME=$HOME/vortex-gpu/vortex VORTEX_BUILD=$HOME/vortex-gpu/vxbuild \
+    make -C workloads/three_source
+GEM5_HOME=$HOME/gem5 CORALNPU_HOME=$HOME/coralnpu \
+    VORTEX_HOME=$HOME/vortex-gpu/vortex gem5int/tests/run_three_source.sh
+
 # CoralNPU 单设备
 GEM5_HOME=$HOME/gem5 CORALNPU_HOME=$HOME/coralnpu gem5int/tests/run_gem5_npu.sh
 
-# Vortex 单设备（tap 验收）
-GEM5_HOME=$HOME/gem5 VORTEX_HOME=$HOME/vortex-gpu/vortex VORTEX_BUILD=/tmp/vxbuild \
-    gem5int/tests/run_vortex.sh
+# Vortex 单设备（tap 验收，不需要 RISC-V 工具链）
+GEM5_HOME=$HOME/gem5 VORTEX_HOME=$HOME/vortex-gpu/vortex gem5int/tests/run_vortex.sh
 
-# 不需要任何仿真器的检查（addrmap 同步性 + 165 项自测）
+# 不需要任何仿真器的检查（addrmap 同步性 + 193 项自测）
 make check
 
 # CoralNPU 设备库的纯 C 冒烟测试（不经 gem5）
 CORALNPU_HOME=$HOME/coralnpu coralnpuint/tests/run_smoke.sh
 ```
 
-`make check` = `gen_addrmap.py --check` + `tools/tests/test_tools.py`（102 项）+
-`libhettrace/tests/test_writer.cc`（63 项）。两套自测都不用 pytest / gtest，各自数检查项、
+`make check` = `gen_addrmap.py --check` + `tools/tests/test_tools.py`（123 项）+
+`libhettrace/tests/test_writer.cc`（70 项）。两套自测都不用 pytest / gtest，各自数检查项、
 各自定退出码 —— 少两个依赖，在只有 gem5 自带 python 的机器上也能跑。
 
 `gen_addrmap.py --check` 只校验生成物是否与 `addrmap.json` 同步，不写文件，适合放在 CI 的

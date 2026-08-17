@@ -5,11 +5,13 @@
     "均由 scripts/gen_addrmap.py 从本文件生成；`make check-addrmap` 校验其未过期。",
     "",
     "硬约束：CoralNPU 的 AXI 地址位宽为 32 (hw_sim/hw_primitives.h 中 AxiAddr::addr_bits_addr",
-    "为 uint32_t)，因此任何 NPU 需要触及的区域必须落在 4GiB 以内。这排除了 Vortex",
-    "VortexGPGPU.py 里 pin_addr 的默认值 0x100000000 —— 见 regions.vortex_vram。"
+    "为 uint32_t)，因此任何 NPU 需要触及的区域必须落在 4GiB 以内 —— 这是 npu_addr_bits，",
+    "只约束 accessors 里含 coralnpu 的区域，不是整张图的宽度。整张图是 64 位的，因为",
+    "vortex_bar 必须落在 4GiB 之上（原因见 regions.vortex_bar）。"
   ],
 
-  "addr_bits": 32,
+  "map_addr_bits": 64,
+  "npu_addr_bits": 32,
   "ticks_per_second": 1000000000000,
 
   "sources": [
@@ -80,8 +82,8 @@
       "base": "0xa0000000",
       "size": "0x10000000",
       "kind": "dram",
-      "accessors": ["host", "vortex"],
-      "note": "Vortex VRAM，经 BAR 对 host 可见。必须以此值覆盖 VortexGPGPU.py 里 pin_addr 的默认 0x100000000，否则超出 CoralNPU 的 32 位可寻址范围。"
+      "accessors": ["vortex"],
+      "note": "Vortex 设备**内部**地址空间里的一段，给 vortex_only.py 的裸机内核用（workloads/vortex_smoke/kernel.S 写死了这个基址）。accessors 只有 vortex：Vortex 的内存是设备内的 simx::RAM，host 碰不到这个地址 —— 同一批字节在 host 侧的物理地址是 pin_addr + dev_addr，落在 vortex_bar 里。写成 host+vortex 会让它进 HANDOFF_REGIONS，而那是个永远不可能被两源共同触及的候选，等于给 validate 塞了个假线索。"
     },
     {
       "name": "npu_work",
@@ -98,6 +100,14 @@
       "kind": "mmio",
       "accessors": ["host", "coralnpu"],
       "note": "NPU 经 AXI master 访问的 4×u32 mailbox。参考实现把所有非 DDR 的 master 访问都当 mailbox；本工程收窄为显式窗口，落在窗口外一律记为 unmapped 并计数。"
+    },
+    {
+      "name": "vortex_bar",
+      "base": "0x100000000",
+      "size": "0x100000000",
+      "kind": "bar",
+      "accessors": ["host", "vortex"],
+      "note": "host 看向 Vortex 设备内存的窗口，host_pa = pin_addr + dev_addr。base/size 都不是自由参数：sw/runtime/gem5/driver.h 把 PIN_BASE_ADDR/PIN_REGION_SIZE 写成 constexpr，host 运行时按这两个数直接算地址、不做 mmap。size 必须是整 4GiB，因为 mem_alloc 可以发出任意 32 位设备地址、且 .vxbin 装在设备地址 0x80000000；base 必须在 4GiB 之上，否则会撞上 SE 模式下被仿真进程自己的低位 VA 布局。因此本区域**超出** npu_addr_bits —— CoralNPU 的 32 位 AXI 连表达它都做不到，NPU 与 Vortex 无法直接共享字节，见 docs/03-limitations.md。kind 为 bar 而非 dram：它不在 CoralNPU 的 DDR 判定区间内，但它是真实内存流量，所以进 trace_windows。"
     }
   ],
 
@@ -105,5 +115,10 @@
     "base": "0x80000000",
     "size": "0x40000000",
     "note": "CoralNPU 参考实现的 IsDdrAddress() 判定区间 [0x80000000, 0xc0000000)。本映射的四个 dram region 均落于此，保证 NPU 的 DDR 判定无需改动。"
+  },
+
+  "trace_windows": {
+    "regions": ["dram_window", "vortex_bar"],
+    "note": "HETTRACE_FILTER=dram 时 writer 只记录落在这些窗口里的访问。它比 dram_window 多一个 vortex_bar：过滤器要挡掉的是 core-local 命中与 MMIO 寄存器读写，而经 BAR 走的访问是真实的内存流量，两侧（host 与 vortex）都必须留下才能对出共享字节。dram_window 本身的含义不动 —— IsDram() 仍然只表示 CoralNPU 的 DDR 判定。"
   }
 }

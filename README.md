@@ -33,19 +33,35 @@
 |---|---|---|---|
 | 在 gem5 里跑起来、tap 产出记录 | ✅ | ✅ | ✅ |
 | 时间戳来自同一个 `curTick()` | ✅ | ✅ | ✅ |
-| 与 host **共享字节**（不只是共享地址） | — | ✅ 含反向对照 | ❌ 需要 `.vxbin`，见下 |
-| 三源同时跑一遍 | ❌ 未做 | | |
+| 与 host **共享字节**（不只是共享地址） | — | ✅ 含反向对照 | ✅ 经 CP 中转，见下 |
+| Vortex ↔ CoralNPU 直接共享 | | ❌ **结构性不可能** | |
+| 三源同时跑、区间重叠、归并成一条流 | ✅ | | |
 
-主验收是 host + CoralNPU 的协同跑（`gem5int/tests/run_het.sh`，四步，最后一步是反向对照）。
-Vortex 那条腿的 tap 已经验过（`gem5int/tests/run_vortex.sh`，67 条记录、时间戳来自 gem5），
-但 host ↔ Vortex 的字节共享要走 CP 的 `mem_upload` 路径、需要真正的 `.vxbin`，而本机没有
-Vortex 的 LLVM 工具链。每条腿验证到哪一步，
-[docs/03-limitations.md](docs/03-limitations.md) 里有逐项的表。
+三个协同验收，逐层加码：
+
+* `gem5int/tests/run_het.sh` —— host + CoralNPU，四步，最后一步是反向对照。
+* `gem5int/tests/run_vortex_shared.sh` —— host + Vortex，五步，用 Vortex 上游的 `vecadd`
+  回归测试走完整的 host runtime → CP → 核 路径。它的自检通过（`PASSED!`）本身就是字节共享
+  的功能性证据；trace 层面量到 110 条共享 cache line。
+* `gem5int/tests/run_three_source.sh` —— 两条腿**同时**在一个 gem5 进程里（14 秒跑完）。
+  它验的是合起来才能验的那几条：三份 trace 出自同一个 `curTick()`、两个设备的活动区间真的
+  重叠（NPU 那 1.7 us 整个落在 Vortex 那 148 us 里）、两个交接区各自量到共享
+  （host↔NPU 8 条 line / host↔Vortex 106 条）、归并出的 19893 条单调流里三个源交错。
+  负载是 `workloads/three_source/`：Vortex 的活异步提交完立刻启动 NPU，故意让区间重叠 ——
+  串行链虽然更像真实应用，但那样归并流里永远不会出现两源夹在一起的片段。
+
+两条腿的**交接形状不同**：CoralNPU 与 host 直接访问同一段 gem5 内存，Vortex 则是 host 写
+BAR 顶部的暂存区、CP 再把字节搬进设备缓冲。所以 Vortex 的 trace 里必须有 CP 的 DMA 记录
+（`kFlagDma`），否则两边足迹不相交、共享 line 数会是 0 —— 而计算是对的。这个坑和它的后果
+写在 [docs/03-limitations.md](docs/03-limitations.md) 里。
+
+"Vortex ↔ CoralNPU 直接共享"那一格不是待办：`vortex_bar` 必须落在 4 GiB 之上，CoralNPU 的
+AXI 地址只有 32 位，连表达都做不到。要交换数据只能由 host 中转。
 
 ## 快速开始
 
 ```bash
-# 0. 不需要任何仿真器的检查（addrmap 同步性 + 165 项自测）
+# 0. 不需要任何仿真器的检查（addrmap 同步性 + 193 项自测）
 make check
 
 # 1. 装进三棵树（都幂等，都支持 --revert）
@@ -86,6 +102,8 @@ python3 -m hettrace convert  $DIR --preset readwrite -o ram.trace
 | `coralnpuint/` | CoralNPU 侧：设备库 ABI、tap、验证内核、2 个补丁 |
 | `workloads/shared_buffer/` | host + NPU 协同负载（host 那一半） |
 | `workloads/vortex_smoke/` | Vortex tap 验证用的裸机 rv32im 内核 |
+| `workloads/three_source/` | 同时驱动两个设备的 host 负载，三源 trace 就是它产的 |
+| `UPSTREAM.md` | 已验证的上游 commit、构建环境版本 |
 | `docs/` | 设计文档，见下 |
 
 三个 `*int/` 目录都是"装进上游树"的安装器，本仓库不 fork 任何一棵树。

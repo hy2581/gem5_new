@@ -25,6 +25,7 @@
 import argparse
 import os
 import shlex
+import sys
 
 import m5
 from m5.objects import (
@@ -53,10 +54,30 @@ from m5.objects import (
 # ---------------------------------------------------------------------------
 HOST_HEAP     = (0x80000000, 0x10000000)  # host 私有：代码/堆/栈的物理页都从这出
 SHARED_BUFFER = (0x90000000, 0x10000000)  # 三方交接区
-VORTEX_VRAM   = (0xA0000000, 0x10000000)  # Vortex 设备自己持有（BAR），不是 gem5 内存
+VORTEX_VRAM   = (0xA0000000, 0x10000000)  # 设备**内部**地址空间里的一段，不是 gem5
+                                          # 内存，也不是 host 能直接寻址的地址。
+                                          # host 要碰它得经 VORTEX_BAR，见下。
 NPU_WORK      = (0xB0000000, 0x10000000)  # NPU 工作区，host 预置权重
 NPU_PIO       = (0x30000000, 0x00001000)  # CoralNPU SimObject 的寄存器窗口
 VORTEX_CP     = (0x20000000, 0x00000200)  # Vortex CP 寄存器堆
+
+# Vortex 的 BAR 窗口 —— host 经它读写设备内的 simx::RAM。
+#
+# 这两个数**不是**可以随便选的：Vortex 的 host runtime
+# (sw/runtime/gem5/driver.h) 把 PIN_BASE_ADDR / PIN_REGION_SIZE 写成了
+# constexpr，host 侧访问 VRAM 就是往这个固定 VA 上做 volatile 访问。配置这边填的
+# pin_addr 只是决定 membus 把哪段物理地址路由给设备，两边对不上的话 host 的写会落
+# 到别的设备地址上 —— 而设备**不会报错**，只是算出来的结果不对。所以改这里必须同时
+# 改 driver.h，反之亦然。
+#
+# 4 GiB 之上 + 4 GiB 大小是上游选的，理由也成立：BAR 是 host 看设备地址空间的窗口，
+# `dev_addr = 访问地址 - pin_addr`，而 mem_alloc 可以在整个 32 位设备空间里发地址，
+# 所以窗口必须盖满 4 GiB；放在 4 GiB 之上则是为了不撞被仿真进程的低位 VA 布局。
+#
+# 这也是它与 addrmap.json 里 vortex_vram (0xa0000000) 的区别：那一条描述的是**设备
+# 内部**的地址（Vortex tap 记的就是设备地址），这一条是**host 物理**窗口。同一段字节
+# 在两侧有两个地址，差一个 pin_addr。
+VORTEX_BAR    = (0x100000000, 0x100000000)
 
 PAGE = 0x1000
 
@@ -130,6 +151,15 @@ def parse_args():
     ap.add_argument("--vortex-host-rt-dir", default="",
                     help="含 libvortex.so 与 libvortex-gem5-x86_64.so 的目录；"
                          "给了就自动补 LD_LIBRARY_PATH 与 VORTEX_DRIVER")
+    ap.add_argument("--vortex-bar-skew", type=lambda s: int(s, 0), default=0,
+                    help="反向对照用：把 BAR 的物理基址挪开这么多字节，而 host "
+                         "runtime 里那个 constexpr 不动。于是 host 的写落到别的设备"
+                         "地址上 —— 地址流看着一切正常，只有数据是错的。协同负载的"
+                         "自检必须因此失败，否则说明'共享'那一遍是碰巧过的")
+    ap.add_argument("--vortex-trace-dev-view", action="store_true",
+                    help="让 Vortex tap 记原始设备内地址，而不是默认的 BAR 物理"
+                         "视角。只看设备侧局部性时用；这样记出来的地址会被 addrmap "
+                         "归到别的区域名下，不能与 host trace 对比")
 
     ap.add_argument("--num-cpus", type=int, default=4,
                     help="CPU 线程上下文数。Vortex 的 host runtime 会起工作线程，"
@@ -255,15 +285,24 @@ def build_vortex(system, args):
         kernel=args.vortex_kernel,
         pio_addr=VORTEX_CP[0],
         pio_size=VORTEX_CP[1],
-        # pin_addr 的默认值是 0x100000000（4GiB 之上）。这里必须按 addrmap.json
-        # 改成 0xa0000000：CoralNPU 的 AXI 地址是 32 位的，4GiB 以上的地址它根本
-        # 表达不了，而三方共用一张地址图是本项目的前提。
-        pin_addr=VORTEX_VRAM[0],
-        pin_size=VORTEX_VRAM[1],
+        # 见 VORTEX_BAR 处的说明：这个值由 driver.h 的 constexpr 决定，不是自由参数。
+        # --vortex-bar-skew 会故意把它挪开，用来做反向对照。
+        pin_addr=VORTEX_BAR[0] + args.vortex_bar_skew,
+        pin_size=VORTEX_BAR[1],
         clk_domain=SrcClockDomain(
             clock=VORTEX_CLOCK, voltage_domain=system.clk_domain.voltage_domain
         ),
         trace_enable=True,
+        # Vortex tap 记的是**设备内**地址。加上 pin_addr 之后与 host 侧记的 BAR
+        # 物理地址就是同一个数，两份 trace 才能按地址对起来（同一段字节在两侧本来
+        # 差一个 pin_addr，见 VORTEX_BAR 的说明）。
+        #
+        # 这里默认开着，因为不开的后果不是"另一种视角"而是**错的区域归属**：设备内
+        # 地址 0x10000 会被 addrmap 归到 npu_slave，设备内的 .vxbin 代码段
+        # 0x80000000 会被归到 host_heap。那种"有区域名、但是别人的地盘"比 unmapped
+        # 难查得多 —— unmapped 至少会被 validate 数出来。
+        # --vortex-trace-dev-view 关掉它，用于只看设备侧局部性、不与 host 对比时。
+        trace_addr_offset=(0 if args.vortex_trace_dev_view else VORTEX_BAR[0]),
     )
     system.vortex.pio = system.membus.mem_side_ports
     system.vortex.dma = system.membus.cpu_side_ports
@@ -299,11 +338,32 @@ def map_device_windows(process, args):
     if args.vortex_library:
         # CP 窗口只有 0x200 字节，映射得按页对齐，所以给整页。
         regions.append(("vortex_cp", (VORTEX_CP[0], PAGE)))
-        regions.append(("vortex_vram", VORTEX_VRAM))
+        # BAR 窗口按 driver.h 的 constexpr 映射，**不带** --vortex-bar-skew ——
+        # 反向对照要制造的正是"host 以为 BAR 在这、设备其实在那"的错位。
+        regions.append(("vortex_bar", VORTEX_BAR))
 
     for name, (base, size) in regions:
         process.map(base, base, size, cacheable=False)
         print(f"  map {name:<14} VA=PA=0x{base:08x} +0x{size:x} uncacheable")
+
+
+def die(msg):
+    """报一句话然后退出。
+
+    **不要**写成 `raise SystemExit("错误: ...")`。在 gem5 里那句话根本不会被打出
+    来：src/sim/main.cc 捕获 SystemExit 之后做的是 `e.value().attr("code")
+    .cast<int>()`，code 是个 str 就抛 pybind11::cast_error，进程 terminate 掉，屏幕
+    上只剩
+
+        terminate called after throwing an instance of 'pybind11::cast_error'
+          what():  Unable to cast Python instance of type <class 'str'> to C++ type 'int'
+        Program aborted at tick 0
+
+    加一段 libc backtrace。那个现象与真实原因（某个 --xxx 指的文件不存在）毫无关
+    系，而且看着像 gem5 或设备库炸了。本项目在三源负载上花了一轮排查才找到这里。
+    """
+    print(msg, file=sys.stderr)
+    raise SystemExit(1)
 
 
 def main():
@@ -320,11 +380,11 @@ def main():
         checks.append((args.vortex_kernel, "vortex-kernel"))
     for path, what in checks:
         if not os.path.isfile(path):
-            raise SystemExit(f"错误: --{what} 指向的文件不存在: {path}")
+            die(f"错误: --{what} 指向的文件不存在: {path}")
     if args.npu_kernel and not args.npu_library:
-        raise SystemExit("错误: 给了 --npu-kernel 却没给 --npu-library")
+        die("错误: 给了 --npu-kernel 却没给 --npu-library")
     if args.vortex_kernel and not args.vortex_library:
-        raise SystemExit("错误: 给了 --vortex-kernel 却没给 --vortex-library")
+        die("错误: 给了 --vortex-kernel 却没给 --vortex-library")
 
     system = System()
     system.clk_domain = SrcClockDomain(

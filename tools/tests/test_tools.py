@@ -61,14 +61,31 @@ def test_addrmap_generated_in_sync():
 
 
 def test_addrmap_invariants():
-    # CoralNPU 只有 32 位地址空间，所有 DRAM 区域必须落在 4GiB 内。
-    for name, (base, size, kind, _acc) in addrmap.REGIONS.items():
-        if kind != "dram":
-            continue
-        check(base + size <= (1 << addrmap.ADDR_BITS),
-              "DRAM 区域 %s 超出 %d 位可寻址范围" % (name, addrmap.ADDR_BITS))
-        check(addrmap.is_dram(base),
-              "DRAM 区域 %s 应落在 CoralNPU 的 DDR 判定窗口内" % name)
+    for name, (base, size, kind, acc) in addrmap.REGIONS.items():
+        # CoralNPU 的 AXI 地址是 uint32_t：它够不到的区域不能列它作 accessor。
+        # 这个检查按 accessor 而不是按 kind 来判 —— vortex_bar 就在 4GiB 之上，
+        # 它是合法的，只是 NPU 碰不到。
+        if "coralnpu" in acc:
+            check(base + size <= (1 << addrmap.NPU_ADDR_BITS),
+                  "%s 有 coralnpu accessor 但超出其 %d 位可寻址范围"
+                  % (name, addrmap.NPU_ADDR_BITS))
+        check(base + size <= (1 << addrmap.MAP_ADDR_BITS),
+              "区域 %s 超出地址图的 %d 位范围" % (name, addrmap.MAP_ADDR_BITS))
+        if kind == "dram":
+            check(addrmap.is_dram(base),
+                  "DRAM 区域 %s 应落在 CoralNPU 的 DDR 判定窗口内" % name)
+        # 凡是要参与共享字节比对的区域都必须过得了 dram 过滤器，否则记录会被
+        # 默默丢掉 —— 那是最难查的一类失败：trace 存在、就是少了几条。
+        if kind in ("dram", "bar"):
+            check(addrmap.is_traced(base) and addrmap.is_traced(base + size - 1),
+                  "区域 %s 应整个落在 trace 窗口内" % name)
+
+    check(addrmap.is_traced(addrmap.REGIONS["vortex_bar"][0]),
+          "vortex_bar 必须过得了 dram 过滤器 —— 经 BAR 的访问是真实内存流量")
+    check(not addrmap.is_dram(addrmap.REGIONS["vortex_bar"][0]),
+          "vortex_bar 不在 CoralNPU 的 DDR 判定窗口内，is_dram 应为假")
+    check(not addrmap.is_traced(addrmap.REGIONS["vortex_cp"][0]),
+          "CP 寄存器不是内存流量，不该进 trace")
 
     check(addrmap.SHARED_REGIONS, "必须至少有一个三方共享区")
     for name in addrmap.SHARED_REGIONS:
@@ -206,13 +223,36 @@ def test_validate_accepts_healthy():
         shutil.rmtree(d)
 
 
+def test_validate_accepts_bar_pair():
+    """host + Vortex 经 BAR 交接、完全不碰 shared_buffer —— 必须放行。
+
+    这条盯的是一个具体的回归：交接区按源的配对而不同，validate 若只认三方共享区
+    就会把这种合法跑法判成"无信息量"。
+    """
+    d = tmpdir()
+    try:
+        synth.gen_bar_pair(d, n=40)
+        issues, summaries, errs, _warns = _run_validate(d)
+        check(not errs, "host+Vortex 经 BAR 交接不应有 ERROR，实际: %r"
+              % [(e.source, e.message) for e in errs])
+        check(len(summaries) == 2, "应汇总 2 个源")
+        infos = [i for i in issues if i.level == "INFO"]
+        check(any("vortex_bar" in i.message for i in infos),
+              "应报告 vortex_bar 被两源共同访问")
+        _sizes, pairwise, _lb = stats.footprint(d)
+        check(pairwise.get(("host", "vortex"), 0) > 0,
+              "两源经 BAR 应量出共享 cache line，实际 %r" % pairwise)
+    finally:
+        shutil.rmtree(d)
+
+
 def test_validate_catches_no_sharing():
     d = tmpdir()
     try:
         synth.gen_broken_no_sharing(d)
         _i, _s, errs, _w = _run_validate(d)
-        check(any("共享" in e.message for e in errs),
-              "应报出共享区无人触及，实际: %r" % [e.message for e in errs])
+        check(any("交接" in e.message for e in errs),
+              "应报出无跨源交接，实际: %r" % [e.message for e in errs])
     finally:
         shutil.rmtree(d)
 

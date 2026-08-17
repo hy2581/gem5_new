@@ -104,8 +104,8 @@ host 的 cache 与两个设备之间没有任何一致性协议。共享区靠"�
 | tap 产出记录、时间戳来自 `curTick()` | ✅ | ✅ | ✅ |
 | `clock_period_ticks` 与配置一致 | ✅ 500 | ✅ 2000 | ✅ 1000 |
 | `unmapped` / `non_monotonic` 为 0 | ✅ | ✅ | ✅ |
-| 与 host **共享字节**（不只是共享地址） | — | ✅ 含反向对照 | ❌ 未验证 |
-| 三源同时跑一遍 | ❌ 未验证 | | |
+| 与 host **共享字节**（不只是共享地址） | — | ✅ 含反向对照 | ✅ 见下 |
+| 三源同时跑一遍、归并成一条流 | ✅ 见下 | | |
 
 ### host + CoralNPU：完整闭环，已验证
 
@@ -115,31 +115,90 @@ cache line 8 条（`in[256B]` 4 条 + `out[256B]` 4 条）；NPU 的区间
 `[145734000, 147392000]` 套在 host 的 `[2000, 152893000]` 里面，证明两边同一个
 `curTick()`。反向对照 `--npu-no-share` 如期失败。
 
-### Vortex：tap 已通电，协同未验证
+### host + Vortex：已验证，但走的是"中转"而不是"直接共享"
 
-已验证（`gem5int/tests/run_vortex.sh`，无 CPU 的单设备配置）：
+两个测试：
 
-* 5 个补丁干净地打进 Vortex 树，`libvortex-gem5.so` 带 tap 编得出来，三个
-  `vortex_gem5_trace_*` ABI 符号都在导出表里；
-* gem5 能 dlopen 它、构造 `VortexGPGPU`、从事件队列推它的 `cycle()`；
-* 内核跑完并正常终止，tap 落出 **67 条记录**，`clock_period_ticks=1000`、
-  `unmapped=0`、`non_monotonic=0`、`first_tick=70000`，时间戳确实来自 gem5。
+* `gem5int/tests/run_vortex.sh` —— 无 CPU 的单设备配置，验 tap 本身。5 个补丁干净地打
+  进 Vortex 树，`libvortex-gem5.so` 带 tap 编得出来，三个 `vortex_gem5_trace_*` ABI 符号
+  都在导出表里；gem5 能 dlopen 它、构造 `VortexGPGPU`、从事件队列推它的 `cycle()`；内核
+  跑完并正常终止，tap 落出 **67 条记录**，`clock_period_ticks=1000`、`unmapped=0`、
+  `non_monotonic=0`、`first_tick=70000`。
+* `gem5int/tests/run_vortex_shared.sh` —— host + Vortex 的异构验收，用 Vortex 上游的
+  `vecadd` 回归测试（`-n64`）。它走完整的 host runtime → CP → 核 路径，自检全部 64 个
+  结果，所以 `PASSED!` 这一行本身就是字节真的共享了的功能性证据。一次实测：host 19422
+  条（10134 `host_heap` / 9288 `vortex_bar`）、vortex 287 条（100% `vortex_bar`，其中
+  CP DMA 268 条 + 核 19 条）、共享 cache line **110 条**，两源 `unmapped=0`、
+  `non_monotonic=0`。
 
-**未验证**：host 与 Vortex 之间的字节共享。原因是本机没有 Vortex 的 LLVM 工具链
-（`llvm-vortex` + `libc32` + `libcrt32`），编不出正常的 `.vxbin`；而 host ↔ Vortex 的数据
-交接必须走 CP 的 `mem_upload` + `CMD_DCR_*` 路径，那条路要求真正的 `.vxbin` 内核。
-`run_vortex.sh` 用的是手写的裸机 rv32im 平坦镜像（`workloads/vortex_smoke/kernel.S`），
-它只在设备内部地址空间里读写，够验证 tap，不够验证共享。
+**但交接的形状与 CoralNPU 那条腿不一样**，这一点必须写清楚，否则会照着 CoralNPU 的直觉
+去读 Vortex 的 trace：
 
-于是 Vortex 腿在 `het_system.py` 里的接线（`pin_addr` 覆盖成 `0xa0000000`、pio 与 dma 都
-接到 membus）是**代码完备但未跑过**的。补齐的路径见
-[04-integration.md](04-integration.md)："装 Vortex 工具链"那一节。
+CoralNPU 与 host 是**直接**共享 —— 两边访问同一段 gem5 内存（`shared_buffer`）里的同一
+批字节。Vortex 不是。Vortex 的内存是设备内的 `simx::RAM`，host 只能经 BAR 摸到它，而且
+host runtime 只往 BAR 顶部一个 **64 MiB 的暂存区**里写（`sw/runtime/gem5/vortex.cpp` 的
+`GEM5_HOST_BASE = PIN_REGION_SIZE - GEM5_HOST_APERTURE`，即设备地址 `0xfc000000`）：命令
+环、完成槽、以及每次 `mem_copy` 的数据都在那里。而内核用的缓冲由设备侧的分配器从
+`ALLOC_BASE_ADDR` 往上发（实测在设备地址 `0x10000` 一带），`.vxbin` 装在 `0x80000000`。
 
-### 三源同时跑：未做
+**是 CP 把字节从暂存区搬到缓冲的。** 所以 host 的足迹和核的足迹本来就不相交 —— 把两边接
+起来的是中间那一次搬运。
 
-现有的两个测试是"host + CoralNPU"和"Vortex 单跑"。三个源在同一次仿真里同时产 trace 没有
-跑过。归并工具本身不关心源的个数（`validate` / `stats` 都按目录里发现的文件工作），所以
-这更像是差一个能同时喂三条腿的负载，而不是差机制。
+这件事踩过一次，值得记下来：CP 的 DMA 直接读写 `simx::RAM`，既不过 Vortex 的 cache 层级
+也不过 `vortex::Memory`，所以挂在 `pre_send_hook` 上的 tap **完全看不见它**。当时的结果
+是：计算正确（`PASSED!`）、trace 干净（`unmapped=0`、`non_monotonic=0`）、两份文件都在，
+但共享 cache line = **0**。一份看起来毫无问题的 trace，会让下游得出"host 与 Vortex 没有
+共享"的结论，而字节其实是共享的。补法是在 `CommandProcessor::Hooks::dram_{read,write}` 上
+另接一路，打 `kFlagDma`（见 [02-trace-format.md](02-trace-format.md)）。这一路同时也补回
+了设备内存流量里最大的一块：一次 vecadd 里 CP 搬了 17152 字节，核自己只出了 1216 字节。
+
+顺带一个结构性结论：**Vortex 与 CoralNPU 之间不可能直接共享字节。** `vortex_bar` 必须落在
+4 GiB 之上，而 CoralNPU 的 AXI 地址只有 32 位，连表达那个地址都做不到。要让它们交换数据，
+只能由 host 做中转（读回 Vortex 的结果、再写进 `npu_work`）。理由见
+[01-address-map.md](01-address-map.md) 的硬约束 1。
+
+### 三源同时跑：已验证，但"并发度"这个词要小心
+
+`gem5int/tests/run_three_source.sh` 五步全过，用的负载是
+`workloads/three_source/host_main.cpp` —— 一个 host 程序同时驱动两个设备：先把 Vortex 的
+活异步提交下去（**不等**），紧接着写 `NPU_CTRL` 启动 NPU。一次实测（整跑 14 秒）：
+
+| 源 | 记录 | 字节 | 区间 (tick) | 区域 |
+|---|---|---|---|---|
+| host | 19486 | 717248 | `[1500, 2374683000]` | 51.5% `host_heap` / 47.5% `vortex_bar` / 1.0% `shared_buffer` |
+| vortex | 279 | 17856 | `[2175760000, 2324172000]` | 100% `vortex_bar` |
+| coralnpu | 128 | 1280 | `[2292498000, 2294156000]` | 100% `shared_buffer` |
+
+两个交接同时成立：host ↔ coralnpu 共享 8 条 line（`shared_buffer` 里的 `in[]`+`out[]`），
+host ↔ vortex 共享 106 条（`vortex_bar` 里 CP 搬运的那批）。coralnpu ↔ vortex 是 **0**，
+而且测试把这个 0 当成**期望值**来判 —— 理由见下一段。归并出来是 19893 条按 tick 单调的单
+流，源切换 76 次；NPU 那 1658000 tick 的活动期里三个源都有记录（coralnpu 128 / host 40 /
+vortex 10），也就是说交错是真的交错，不是三段首尾相接。
+
+**为什么要费劲让两个设备的区间重叠**：本项目的 trace 是喂给下游 DRAM 模拟器的输入。串成
+`host -> Vortex -> host -> NPU` 一条链固然更像真实应用，但那样两个设备的区间必然不相交，
+归并出来的流里永远不存在两源夹在一起的片段 —— 下游连"两个 master 同时压一个控制器"这件事
+都构造不出来。`validate` 会把这个形状报成 WARN，它报得对。
+
+**代价**：这个负载没有演示"Vortex 的结果流给 NPU"。那不是遗漏 —— 见上一节的结构性结论，
+两个设备之间只能由 host 中转，而 host 中转就是那条串行链。两者不可兼得。
+
+**"并发度"要看清楚是什么**：`stats` 会打一行"多源并发窗口 22 / 2375 (0.9%)"。这个比例低
+不是负载没做到重叠，而是三件事叠出来的：
+
+* NPU 只干 943 个 500MHz 周期（1.7 us），Vortex 那次 launch 是 148 us —— 两个设备本身的规
+  模差了两个数量级，重叠区间最多也就是 NPU 那 1.7 us；
+* host 等 NPU 的那段是在轮询 `npu_pio`，而 PIO 不在 trace 窗口里（见
+  [02-trace-format.md](02-trace-format.md) 的 `trace_windows`），所以 host 在这段时间里
+  "没有访存"；
+* 窗口宽度默认 1 us，1.7 us 的重叠最多落进两个窗。
+
+所以"三源同时跑"这件事成立（区间重叠、归并流里三源交错），但**不要**把 0.9% 当成"这套系
+统的并发能力"。要提高这个数只有加大 NPU 侧的工作量，那要改 `ddr_touch.cc` 的内核，而它同
+时是 `run_het.sh` 的判据内核，不该为了一个统计数字去动。
+
+还有一条老限制在这里照旧成立：三个源共享一把时间尺子，但**不共享一条排队的通道**（本文档
+第 1 条）。所以重叠区间里的"同时"是"同时发生"，不是"同时争用"。争用要下游模拟器去算。
 
 ## 反向对照：为什么正向跑通不算证据
 
@@ -157,3 +216,25 @@ cache line 8 条（`in[256B]` 4 条 + `out[256B]` 4 条）；NPU 的区间
 同样的思路也用在单设备验收 `run_gem5_npu.sh` 的最后一步：把 `shared_buffer` 的内存控制
 器从配置里挪走，gem5 必须 fatal —— 这证明 NPU 的访存真的落在 gem5 的内存上，而不是被别
 的什么东西接了。两个测试里的反向对照针对的是两种不同的假通过，都不能省。
+
+### 两个看着像反向对照、其实不能用的（Vortex 腿）
+
+都真跑过。记在这里，免得后人重走，也因为它们说明了一个更一般的问题。
+
+**`--vortex-bar-skew 0x10000000`** —— 把设备声明的 BAR 区间挪开。因果上有效：host 拿不
+到设备，跑到 `max_ticks` 也不会 `PASSED`。但**不能**拿共享 line 数当判据。host 访问的物
+理地址是 `PIN_BASE + dev_addr`，由 `driver.h` 的 `constexpr` 决定，与 skew 无关；而 tap
+记的是 `dev_addr' + PIN_BASE`，其中 `dev_addr'` 是 CP 从命令环里读到的设备地址，也与 skew
+无关。两个数**数值上照样相等** —— 实测共享 line 数一点没降，尽管两边碰的根本不是同一批
+字节。
+
+**`--vortex-trace-dev-view`** —— 关掉 tap 的地址偏移，让它记设备内地址。用它判共享 line
+数同样会被骗：设备内的 `.vxbin` 代码段在 `0x80000000`，正好撞上 host 私有堆 `host_heap`
+的基址，于是量出 65 条"共享"，全是假的。所以 `run_vortex_shared.sh` 只用它判**区域归
+属**（关掉偏移后记录必须跑进 `host_heap`、`vortex_bar` 里必须一条不剩），不判共享。
+
+一般的结论：**两个源的地址集重合度，只有在两边都换算到同一个物理空间之后才有意义。**
+"地址相等"和"字节相同"在多地址空间的系统里是两件事，而 footprint 这类指标分不出来 —— 它
+看到的只是数。这就是 `het_system.py` 把 BAR 视角设成默认、而不是留给用户选的原因；也是
+Vortex 腿的最终判据落在 `vecadd` 的自检（`PASSED!`）而不是落在共享 line 数上的原因。共享
+line 数在那里是**辅助证据**，不是主证据。

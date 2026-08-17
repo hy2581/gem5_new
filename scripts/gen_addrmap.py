@@ -36,11 +36,28 @@ def load():
     return m
 
 
+def trace_windows(m):
+    """把 trace_windows.regions 里的名字解析成 (name, base, size) 列表。
+
+    名字既可以指 dram_window，也可以指某个 region —— 这样窗口只有一处定义。
+    """
+    out = []
+    by_name = {r["name"]: (r["base_i"], r["size_i"]) for r in m["regions"]}
+    for name in m["trace_windows"]["regions"]:
+        if name == "dram_window":
+            out.append((name, m["dram_window"]["base_i"], m["dram_window"]["size_i"]))
+        else:
+            base, size = by_name[name]
+            out.append((name, base, size))
+    return out
+
+
 def validate(m):
     """映射自身的健全性检查 —— 生成前必须过。"""
     errs = []
-    bits = m["addr_bits"]
-    limit = 1 << bits
+    limit = 1 << m["map_addr_bits"]
+    npu_bits = m["npu_addr_bits"]
+    npu_limit = 1 << npu_bits
 
     regs = sorted(m["regions"], key=lambda r: r["base_i"])
     for r in regs:
@@ -48,7 +65,14 @@ def validate(m):
         if end > limit:
             errs.append(
                 "region %s 结束于 0x%x，超出 %d 位可寻址范围 0x%x"
-                % (r["name"], end, bits, limit)
+                % (r["name"], end, m["map_addr_bits"], limit)
+            )
+        # CoralNPU 的 AXI 地址是 uint32_t：它够不到的地址不能列它作 accessor，
+        # 否则约束会在运行时以"地址被截断成低 32 位"的形式无声失效。
+        if "coralnpu" in r["accessors"] and end > npu_limit:
+            errs.append(
+                "region %s 结束于 0x%x，超出 CoralNPU 的 %d 位可寻址范围 0x%x"
+                % (r["name"], end, npu_bits, npu_limit)
             )
     for a, b in zip(regs, regs[1:]):
         a_end = a["base_i"] + a["size_i"]
@@ -90,6 +114,11 @@ def validate(m):
     if not shared:
         errs.append("没有任何 region 被三方共同访问 —— 异构 trace 将无信息量")
 
+    known = set(r["name"] for r in m["regions"]) | {"dram_window"}
+    for name in m["trace_windows"]["regions"]:
+        if name not in known:
+            errs.append("trace_windows 里的 %r 既不是 region 也不是 dram_window" % name)
+
     return errs
 
 
@@ -108,7 +137,10 @@ def gen_h(m):
     a("")
     a("namespace hettrace {")
     a("")
-    a("constexpr int      kAddrBits       = %d;" % m["addr_bits"])
+    a("// kMapAddrBits 是这张图的宽度；kNpuAddrBits 是 CoralNPU 的 AXI 地址位宽，")
+    a("// 只约束 NPU 需要触及的区域（vortex_bar 就在它之外）。")
+    a("constexpr int      kMapAddrBits    = %d;" % m["map_addr_bits"])
+    a("constexpr int      kNpuAddrBits    = %d;" % m["npu_addr_bits"])
     a("constexpr uint64_t kTicksPerSecond = %dull;" % m["ticks_per_second"])
     a("")
     a("// ---- 源 ID ----")
@@ -188,6 +220,33 @@ def gen_h(m):
     a("           addr <  kDramWindowBase + kDramWindowSize;")
     a("}")
     a("")
+    a("// ---- trace 过滤窗口 ----")
+    a("// %s" % m["trace_windows"]["note"].replace("\n", " "))
+    a("struct TraceWindow {")
+    a("    const char* name;")
+    a("    uint64_t    base;")
+    a("    uint64_t    size;")
+    a("};")
+    a("")
+    a("constexpr TraceWindow kTraceWindows[] = {")
+    for name, base, size in trace_windows(m):
+        a('    { "%s", 0x%xull, 0x%xull },' % (name, base, size))
+    a("};")
+    a("constexpr size_t kNumTraceWindows =")
+    a("    sizeof(kTraceWindows) / sizeof(kTraceWindows[0]);")
+    a("")
+    a("// HETTRACE_FILTER=dram 时 writer 的判据。窗口只有两三个，线性扫描即可 ——")
+    a("// 但它**在** per-access 热路径上，所以别往里加东西。")
+    a("inline bool IsTraced(uint64_t addr) {")
+    a("    for (size_t i = 0; i < kNumTraceWindows; ++i) {")
+    a("        if (addr >= kTraceWindows[i].base &&")
+    a("            addr <  kTraceWindows[i].base + kTraceWindows[i].size) {")
+    a("            return true;")
+    a("        }")
+    a("    }")
+    a("    return false;")
+    a("}")
+    a("")
     a("inline bool IsShared(uint64_t addr) {")
     a("    return addr >= kSharedBufferBase &&")
     a("           addr <  kSharedBufferBase + kSharedBufferSize;")
@@ -210,7 +269,10 @@ def gen_py(m):
     a("")
     a('统一物理地址空间 —— Python 侧镜像。"""')
     a("")
-    a("ADDR_BITS = %d" % m["addr_bits"])
+    a("# MAP_ADDR_BITS 是这张图的宽度；NPU_ADDR_BITS 是 CoralNPU 的 AXI 地址位宽，")
+    a("# 只约束 NPU 需要触及的区域（vortex_bar 就在它之外）。")
+    a("MAP_ADDR_BITS = %d" % m["map_addr_bits"])
+    a("NPU_ADDR_BITS = %d" % m["npu_addr_bits"])
     a("TICKS_PER_SECOND = %d" % m["ticks_per_second"])
     a("")
     a("LEVELS = {")
@@ -246,9 +308,24 @@ def gen_py(m):
     a("")
     a("DRAM_WINDOW = (0x%X, 0x%X)" % (m["dram_window"]["base_i"], m["dram_window"]["size_i"]))
     a("")
+    a("# HETTRACE_FILTER=dram 时 writer 记录的窗口 —— 比 DRAM_WINDOW 多一个 vortex_bar。")
+    a("# %s" % m["trace_windows"]["note"].replace("\n", " "))
+    a("TRACE_WINDOWS = (")
+    for name, base, size in trace_windows(m):
+        a('    ("%s", 0x%X, 0x%X),' % (name, base, size))
+    a(")")
+    a("")
     shared = [r["name"] for r in m["regions"] if len(r["accessors"]) >= 3]
     a("# 三方共享区 —— 归并工具据此判定真实共享")
     a("SHARED_REGIONS = %r" % (tuple(shared),))
+    a("")
+    handoff = [r["name"] for r in m["regions"] if len(r["accessors"]) >= 2]
+    a("# 任意两源都可能在此交接的区域（accessor >= 2）。validate 用它回答"
+      '"这批 trace')
+    a("# 里到底有没有跨源交接\"—— 不同的源两两配对，交接区不是同一个：host+NPU 在")
+    a("# shared_buffer / npu_work，host+Vortex 在 vortex_bar。只盯 SHARED_REGIONS")
+    a("# 会把合法的两源跑法误判成无信息量。")
+    a("HANDOFF_REGIONS = %r" % (tuple(handoff),))
     a("")
     a("")
     a("def region_of(addr):")
@@ -262,6 +339,14 @@ def gen_py(m):
     a("def is_dram(addr):")
     a("    base, size = DRAM_WINDOW")
     a("    return base <= addr < base + size")
+    a("")
+    a("")
+    a("def is_traced(addr):")
+    a('    """HETTRACE_FILTER=dram 时该地址是否会被记录。C++ 侧 IsTraced() 的镜像。"""')
+    a("    for _name, base, size in TRACE_WINDOWS:")
+    a("        if base <= addr < base + size:")
+    a("            return True")
+    a("    return False")
     a("")
     a("")
     a("def is_shared(addr):")

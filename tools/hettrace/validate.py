@@ -231,24 +231,31 @@ def _cross_source_checks(summaries):
         )
         return issues
 
-    # 1. 共享区必须被至少两个源真实触及，否则三条 trace 互不相关，
+    # 1. 至少有一个交接区被两个源真实触及，否则这几条 trace 互不相关，
     #    归并出来也看不到任何交接行为。
-    for reg in addrmap.SHARED_REGIONS:
+    #
+    #    这里遍历的是 HANDOFF_REGIONS（accessor >= 2）而不是 SHARED_REGIONS
+    #    （accessor >= 3）：源两两配对时交接区并不是同一个 —— host+CoralNPU 在
+    #    shared_buffer / npu_work 交接，host+Vortex 在 vortex_bar 交接。只盯三方
+    #    共享区会把"host + Vortex 跑一遍"这种合法跑法误判成无信息量。
+    found = []
+    for reg in addrmap.HANDOFF_REGIONS:
         touchers = [s.name for s in live if s.regions.get(reg, 0) > 0]
-        if len(touchers) < 2:
+        if len(touchers) >= 2:
+            found.append(reg)
             issues.append(
-                Issue(
-                    "ERROR",
-                    "-",
-                    "共享区 %s 只被 %s 触及 —— 负载没有真正的跨设备数据交接，"
-                    "trace 退化为三条不相干的流"
-                    % (reg, touchers or "任何源都没有"),
-                )
+                Issue("INFO", "-", "交接区 %s 被 %s 共同访问" % (reg, ", ".join(touchers)))
             )
-        else:
-            issues.append(
-                Issue("INFO", "-", "共享区 %s 被 %s 共同访问" % (reg, ", ".join(touchers)))
+    if not found:
+        issues.append(
+            Issue(
+                "ERROR",
+                "-",
+                "没有任何交接区被两个以上的源触及（候选：%s）—— 负载没有真正的"
+                "跨设备数据交接，trace 退化为几条不相干的流"
+                % ", ".join(addrmap.HANDOFF_REGIONS),
             )
+        )
 
     # 2. 时间区间必须重叠。不重叠说明三者是串行跑的，没有任何争抢可分析。
     for i in range(len(live)):

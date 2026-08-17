@@ -42,6 +42,10 @@ typedef uint64_t (*TickProvider)(void* ctx);
 
 class VortexTraceTap {
   public:
+    // DMA 记录的 ctx。核发出的访问用 hart_id 填 ctx，而 CP 没有 hart —— 用 0 会
+    // 让 DMA 混进 hart 0 的足迹里，所以给一个不可能是 hart_id 的哨兵值。
+    static constexpr uint32_t kDmaCtx = 0xffffffffu;
+
     VortexTraceTap() = default;
 
     // 安装 tap。HETTRACE_DIR 未设置时返回 false 且什么都不做 —— 调用方应把它
@@ -65,6 +69,42 @@ class VortexTraceTap {
         proc->set_mem_telemetry_hook(
             [this](const vortex::MemReq& req) { this->OnRequest(req); });
         return true;
+    }
+
+    // CP 的 DMA。由 vortex_gpgpu.cpp 的 CommandProcessor::Hooks::dram_{read,write}
+    // 调过来，**不是**从 pre_send hook 来的。
+    //
+    // 为什么必须单独接一条：CP 直接读写 simx::RAM，既不过 Vortex 的 cache 层级也不
+    // 过 vortex::Memory，所以 pre_send hook 完全看不到它。而它恰好是设备内存流量里
+    // 最大的一块 —— .vxbin 镜像上传、以及每次载荷在"暂存区 <-> 设备缓冲"之间的中转
+    // 都走这里。漏掉它有两个后果，都不是"少一点数据"那么轻：
+    //
+    //   1. 带宽被显著低估（一次 vecadd 少算掉几十 KB）；
+    //   2. 更要紧的是 host 与 Vortex 的 trace 会**看起来毫不相关**。host 只碰暂存
+    //      区（driver.h 里那个 PIN 窗口顶部的 64MB aperture），核只碰设备缓冲，两边
+    //      地址集不相交 —— 而把两边接起来的那一次搬运正是 CP 干的。少了这条记录，
+    //      下游会得出"两个源没有共享"的结论，而字节其实是共享的。
+    //
+    // 不接 vram_read/vram_write（host 经 BAR 的那条路）：那些访问已经由 gem5 侧的
+    // host tap 记过一遍了，在这里再记一遍是重复计入。
+    void OnDma(uint64_t addr, uint64_t bytes, hettrace::Op op) {
+        if (!writer_.is_open() || bytes == 0) return;
+        const uint64_t tick = (tick_fn_ != nullptr) ? tick_fn_(tick_ctx_) : 0;
+        // 一次 DMA 可以有几十 KB。按块粒度展开，理由与 EmitBurst 相同：记成一条
+        // 巨大的记录会让局部性分析和 hettrace convert 的下游都失真 —— DRAM 是按块
+        // 搬的。首块不带 kFlagBurstBeat，其余带，与 AXI 侧的约定一致。
+        const uint64_t blk = VX_CFG_MEM_BLOCK_SIZE;
+        const uint64_t end = addr + bytes;
+        bool first = true;
+        for (uint64_t p = addr & ~(blk - 1); p < end; p += blk) {
+            writer_.Emit(tick, static_cast<uint64_t>(
+                                   static_cast<int64_t>(p) + addr_offset_),
+                         static_cast<uint32_t>(blk), op, kDmaCtx,
+                         static_cast<uint8_t>(
+                             hettrace::kFlagDma |
+                             (first ? 0 : hettrace::kFlagBurstBeat)));
+            first = false;
+        }
     }
 
     void Close() { writer_.Close(); }

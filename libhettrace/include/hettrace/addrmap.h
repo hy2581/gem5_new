@@ -10,7 +10,10 @@
 
 namespace hettrace {
 
-constexpr int      kAddrBits       = 32;
+// kMapAddrBits 是这张图的宽度；kNpuAddrBits 是 CoralNPU 的 AXI 地址位宽，
+// 只约束 NPU 需要触及的区域（vortex_bar 就在它之外）。
+constexpr int      kMapAddrBits    = 64;
+constexpr int      kNpuAddrBits    = 32;
 constexpr uint64_t kTicksPerSecond = 1000000000000ull;
 
 // ---- 源 ID ----
@@ -62,7 +65,7 @@ constexpr uint64_t kHostHeapSize = 0x10000000ull;
 constexpr uint64_t kSharedBufferBase = 0x90000000ull;
 constexpr uint64_t kSharedBufferSize = 0x10000000ull;
 
-// vortex_vram: Vortex VRAM，经 BAR 对 host 可见。必须以此值覆盖 VortexGPGPU.py 里 pin_addr 的默认 0x100000000，否则超出 CoralNPU 的 32 位可寻址范围。
+// vortex_vram: Vortex 设备**内部**地址空间里的一段，给 vortex_only.py 的裸机内核用（workloads/vortex_smoke/kernel.S 写死了这个基址）。accessors 只有 vortex：Vortex 的内存是设备内的 simx::RAM，host 碰不到这个地址 —— 同一批字节在 host 侧的物理地址是 pin_addr + dev_addr，落在 vortex_bar 里。写成 host+vortex 会让它进 HANDOFF_REGIONS，而那是个永远不可能被两源共同触及的候选，等于给 validate 塞了个假线索。
 constexpr uint64_t kVortexVramBase = 0xa0000000ull;
 constexpr uint64_t kVortexVramSize = 0x10000000ull;
 
@@ -73,6 +76,10 @@ constexpr uint64_t kNpuWorkSize = 0x10000000ull;
 // npu_mailbox: NPU 经 AXI master 访问的 4×u32 mailbox。参考实现把所有非 DDR 的 master 访问都当 mailbox；本工程收窄为显式窗口，落在窗口外一律记为 unmapped 并计数。
 constexpr uint64_t kNpuMailboxBase = 0xc0000000ull;
 constexpr uint64_t kNpuMailboxSize = 0x10ull;
+
+// vortex_bar: host 看向 Vortex 设备内存的窗口，host_pa = pin_addr + dev_addr。base/size 都不是自由参数：sw/runtime/gem5/driver.h 把 PIN_BASE_ADDR/PIN_REGION_SIZE 写成 constexpr，host 运行时按这两个数直接算地址、不做 mmap。size 必须是整 4GiB，因为 mem_alloc 可以发出任意 32 位设备地址、且 .vxbin 装在设备地址 0x80000000；base 必须在 4GiB 之上，否则会撞上 SE 模式下被仿真进程自己的低位 VA 布局。因此本区域**超出** npu_addr_bits —— CoralNPU 的 32 位 AXI 连表达它都做不到，NPU 与 Vortex 无法直接共享字节，见 docs/03-limitations.md。kind 为 bar 而非 dram：它不在 CoralNPU 的 DDR 判定区间内，但它是真实内存流量，所以进 trace_windows。
+constexpr uint64_t kVortexBarBase = 0x100000000ull;
+constexpr uint64_t kVortexBarSize = 0x100000000ull;
 
 // CoralNPU IsDdrAddress() 判定区间
 constexpr uint64_t kDramWindowBase = 0x80000000ull;
@@ -95,6 +102,7 @@ constexpr Region kRegions[] = {
     { "vortex_vram", 0xa0000000ull, 0x10000000ull, true },
     { "npu_work", 0xb0000000ull, 0x10000000ull, true },
     { "npu_mailbox", 0xc0000000ull, 0x10ull, false },
+    { "vortex_bar", 0x100000000ull, 0x100000000ull, false },
 };
 constexpr size_t kNumRegions = sizeof(kRegions) / sizeof(kRegions[0]);
 
@@ -113,6 +121,33 @@ inline const char* RegionOf(uint64_t addr) {
 inline bool IsDram(uint64_t addr) {
     return addr >= kDramWindowBase &&
            addr <  kDramWindowBase + kDramWindowSize;
+}
+
+// ---- trace 过滤窗口 ----
+// HETTRACE_FILTER=dram 时 writer 只记录落在这些窗口里的访问。它比 dram_window 多一个 vortex_bar：过滤器要挡掉的是 core-local 命中与 MMIO 寄存器读写，而经 BAR 走的访问是真实的内存流量，两侧（host 与 vortex）都必须留下才能对出共享字节。dram_window 本身的含义不动 —— IsDram() 仍然只表示 CoralNPU 的 DDR 判定。
+struct TraceWindow {
+    const char* name;
+    uint64_t    base;
+    uint64_t    size;
+};
+
+constexpr TraceWindow kTraceWindows[] = {
+    { "dram_window", 0x80000000ull, 0x40000000ull },
+    { "vortex_bar", 0x100000000ull, 0x100000000ull },
+};
+constexpr size_t kNumTraceWindows =
+    sizeof(kTraceWindows) / sizeof(kTraceWindows[0]);
+
+// HETTRACE_FILTER=dram 时 writer 的判据。窗口只有两三个，线性扫描即可 ——
+// 但它**在** per-access 热路径上，所以别往里加东西。
+inline bool IsTraced(uint64_t addr) {
+    for (size_t i = 0; i < kNumTraceWindows; ++i) {
+        if (addr >= kTraceWindows[i].base &&
+            addr <  kTraceWindows[i].base + kTraceWindows[i].size) {
+            return true;
+        }
+    }
+    return false;
 }
 
 inline bool IsShared(uint64_t addr) {

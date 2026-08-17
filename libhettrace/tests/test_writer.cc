@@ -273,11 +273,25 @@ static void TestAddrMapSanity() {
     CHECK(IsShared(kSharedBufferBase), "IsShared 应识别 shared_buffer");
     CHECK(!IsShared(kNpuWorkBase), "npu_work 不应被判为共享");
     // CoralNPU 只有 32 位地址；所有 DRAM 区域必须在 4GiB 以内。
+    // 注意这里用 kNpuAddrBits 而不是整张图的宽度：vortex_bar 在 4GiB 之上，
+    // 它是合法的（host 与 Vortex 够得到），只是 NPU 够不到。
     for (size_t i = 0; i < kNumRegions; ++i) {
         if (!kRegions[i].is_dram) continue;
-        CHECK(kRegions[i].base + kRegions[i].size <= (1ull << kAddrBits),
+        CHECK(kRegions[i].base + kRegions[i].size <= (1ull << kNpuAddrBits),
               "DRAM 区域必须落在 CoralNPU 的 32 位可寻址范围内");
     }
+    // 过滤窗口。IsTraced 比 IsDram 宽一个 BAR —— 少了它，host 与 Vortex 经 BAR
+    // 交换的字节会在默认过滤器下被无声丢掉。
+    CHECK(IsTraced(kSharedBufferBase), "shared_buffer 应过得了 dram 过滤器");
+    CHECK(IsTraced(kVortexBarBase), "vortex_bar 应过得了 dram 过滤器");
+    CHECK(IsTraced(kVortexBarBase + kVortexBarSize - 1),
+          "vortex_bar 末端也应在窗口内");
+    CHECK(!IsDram(kVortexBarBase),
+          "vortex_bar 不在 CoralNPU 的 DDR 判定窗口内");
+    CHECK(!IsTraced(kVortexCpBase), "CP 寄存器不是内存流量，不该进 trace");
+    CHECK(!IsTraced(kNpuTcmAddr), "NPU 的 TCM 命中不该进 trace");
+    CHECK(std::strcmp(RegionOf(kVortexBarBase), "vortex_bar") == 0,
+          "RegionOf 应返回 vortex_bar");
     CHECK(std::strcmp(RegionOf(kSharedBufferBase), "shared_buffer") == 0,
           "RegionOf 应返回 shared_buffer");
     CHECK(RegionOf(0xdeadbeef) == nullptr, "未映射地址应返回 nullptr");

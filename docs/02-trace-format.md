@@ -64,9 +64,17 @@ tap 往同一个 fd 里追加，写入顺序是"谁的回调先被调用"，而�
 | 1 | `kFlagPrefetch` | 预取/推测访问，非程序序 |
 | 2 | `kFlagUnmapped` | 地址不在 `addrmap.json` 任何区域内 |
 | 3 | `kFlagInstr` | 取指流量 |
+| 4 | `kFlagDma` | 搬运引擎发出的，不是核发出的 |
 
 `kFlagUnmapped` 是**保留记录并打标**，不是丢弃。地址算错是配置问题，把证据留在 trace
 里比静默丢掉有用得多；`validate` 会把它变成一条 ERROR。
+
+`kFlagDma` 目前只有 Vortex 那一路在用（CP 在暂存区与设备缓冲之间的中转，见
+[03-limitations.md](03-limitations.md)）。它必须能被分出来，因为两类分析对它的处置正好
+相反：分析**核的访存行为**（局部性、cache 效果、per-hart 足迹）要把它排掉，它不经过任何
+cache、也不属于任何 hart；算**DRAM 带宽**则不能排，它是真实占用的流量，一次 vecadd 里
+它比核自己出的流量还多一个量级。带这个位的记录 `ctx` 固定为 `0xffffffff`（Vortex 侧的
+`kDmaCtx`）而不是 0 —— 用 0 会让 DMA 混进 hart 0 的足迹里。
 
 ### AXI burst 的展开
 
@@ -92,7 +100,7 @@ CoralNPU 的 master 回调按拍触发，但每拍携带的 `AxiAddr` 都是整�
 | 源 | src_id | level | 挂点 |
 |---|---|---|---|
 | host | 0 | 0 `kLevelPostLlc` | L2 与 membus 之间的 `CommMonitor` |
-| vortex | 1 | 0 `kLevelPostLlc` | `vortex::Memory` 的 `pre_send_hook`，即 Vortex cache 层级之后 |
+| vortex | 1 | 0 `kLevelPostLlc` | `vortex::Memory` 的 `pre_send_hook`（核出核的流量）**加上** `CommandProcessor::Hooks::dram_{read,write}`（CP 的 DMA，打 `kFlagDma`） |
 | coralnpu | 2 | 2 `kLevelAxiMaster` | 设备的 AXI master 端口 |
 
 host 与 vortex 恰好都是"LLC 之后、DRAM 之前"，所以两者的记录是可比的。CoralNPU 不同：
@@ -150,8 +158,12 @@ AXI master 是设备端口，TCM 命中根本不到那里，所以它的条数�
 |---|---|---|
 | `HETTRACE_DIR` | 未设置 | 输出目录。**未设置 = 完全关闭**，不是错误 |
 | `HETTRACE_FORMAT` | `bin` | `bin` \| `text` |
-| `HETTRACE_FILTER` | `dram` | `dram` 只留 `[0x80000000,0xc0000000)`；`all` 全留 |
+| `HETTRACE_FILTER` | `dram` | `dram` 只留 `trace_windows` 里的地址；`all` 全留 |
 | `HETTRACE_BUFSZ` | `65536` | 缓冲记录条数 |
+
+`dram` 这个名字是历史的，判据是 `IsTraced()` 而**不是** `IsDram()`：窗口是
+`dram_window` ∪ `vortex_bar`，比 CoralNPU 的 DDR 判定区间多一段。为什么要多这一段、以及
+少了它会静默丢掉什么，见 [01-address-map.md](01-address-map.md) 的"过滤窗口"一节。
 
 "未设置就关闭"这条约定让 tap 可以永远编进去：`trace_enable` 这类参数只决定**要不要
 装** tap，装了也不一定产文件。于是一个没有 hettrace 的旧设备库、和一个没设

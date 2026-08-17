@@ -5,8 +5,11 @@
 //   HETTRACE_DIR      输出目录。未设置 => 完全关闭，Emit() 退化为一次分支判断。
 //   HETTRACE_FORMAT   bin(默认) | text
 //   HETTRACE_FILTER   dram(默认) | all
-//                     dram: 只记录落在 DRAM 窗口内的访问。NPU 的 TCM 命中、
-//                     CP 寄存器读写等不是 DRAM 流量，混进来会让带宽统计虚高。
+//                     dram: 只记录落在 addrmap 的 trace_windows 里的访问 ——
+//                     DRAM 窗口，加上 Vortex 的 BAR（经 BAR 的访问也是真实内存
+//                     流量）。NPU 的 TCM 命中、CP 寄存器读写等不是内存流量，
+//                     混进来会让带宽统计虚高。判据是 IsTraced()，不是 IsDram()：
+//                     后者只表示 CoralNPU 的 DDR 判定区间，两者含义不同。
 //   HETTRACE_BUFSZ    缓冲记录条数，默认 65536
 //
 // 线程安全：无。三个 tap 都在 gem5 事件循环线程上被调用（见
@@ -104,7 +107,7 @@ class TraceWriter {
               uint8_t flags = 0) {
         if (!open_) return;
 
-        if (dram_only_ && !IsDram(addr)) {
+        if (dram_only_ && !IsTraced(addr)) {
             ++stats_.filtered;
             return;
         }

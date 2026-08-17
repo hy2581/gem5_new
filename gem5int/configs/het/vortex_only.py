@@ -26,6 +26,7 @@
 
 import argparse
 import os
+import sys
 
 import m5
 from m5.objects import (
@@ -64,7 +65,11 @@ def main():
 
     for path, what in ((args.library, "library"), (args.kernel, "kernel")):
         if not os.path.isfile(path):
-            raise SystemExit(f"错误: --{what} 指向的文件不存在: {path}")
+            # 先 print 再 SystemExit(1)，不能 SystemExit("消息")：gem5 的
+            # src/sim/main.cc 会把 SystemExit.code 强转成 int，字符串会让进程死在
+            # 一个 pybind11::cast_error 上，消息一个字都看不到。
+            print(f"错误: --{what} 指向的文件不存在: {path}", file=sys.stderr)
+            raise SystemExit(1)
 
     system = System()
     system.clk_domain = SrcClockDomain(

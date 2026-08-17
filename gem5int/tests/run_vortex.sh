@@ -3,7 +3,11 @@
 # 时间戳的记录。
 #
 #   GEM5_HOME=$HOME/gem5 VORTEX_HOME=$HOME/vortex-gpu/vortex \
-#       VORTEX_BUILD=/tmp/vxbuild gem5int/tests/run_vortex.sh
+#       gem5int/tests/run_vortex.sh
+#
+# VORTEX_BUILD 默认是 $VORTEX_HOME/../vxbuild。**别把它放在 /tmp 下面** ——
+# Ubuntu 开机会清 /tmp，重启之后 libvortex-gem5.so 就没了，而这个脚本报的是
+# "找不到 .so"，看不出是被系统删的。
 #
 # 前提：
 #   1. vortexint/install.sh 跑过（5 个补丁打进 Vortex 树）；
@@ -28,7 +32,7 @@ SELF_DIR=$(dirname "$(readlink -f "$0")")
 PROJ_DIR=$(dirname "$(dirname "$SELF_DIR")")
 GEM5_HOME=${GEM5_HOME:-$HOME/gem5}
 VORTEX_HOME=${VORTEX_HOME:-$HOME/vortex-gpu/vortex}
-VORTEX_BUILD=${VORTEX_BUILD:-/tmp/vxbuild}
+VORTEX_BUILD=${VORTEX_BUILD:-$(dirname "$VORTEX_HOME")/vxbuild}
 GEM5_BIN=${GEM5_BIN:-$GEM5_HOME/build/X86/gem5.opt}
 CONFIG="$GEM5_HOME/configs/het/vortex_only.py"
 SO="$VORTEX_BUILD/sim/simx/libvortex-gem5.so"

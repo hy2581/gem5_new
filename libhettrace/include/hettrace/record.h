@@ -59,6 +59,11 @@ constexpr uint8_t kFlagBurstBeat = 1u << 0;  // AXI burst 的非首拍
 constexpr uint8_t kFlagPrefetch  = 1u << 1;  // 预取/推测，非程序序访问
 constexpr uint8_t kFlagUnmapped  = 1u << 2;  // 地址不属于任何已声明区域
 constexpr uint8_t kFlagInstr     = 1u << 3;  // 取指流量（可与数据流量分开分析）
+constexpr uint8_t kFlagDma       = 1u << 4;  // 搬运引擎发出的，不是核发出的。
+                                             // Vortex 的 CP 在暂存区与设备缓冲之间
+                                             // 中转字节走的就是这条路：它不经过任何
+                                             // cache，但确实占 DRAM 带宽。分析核的
+                                             // 访存行为时要把它排掉，算带宽时不能排
 
 #pragma pack(push, 1)
 struct Record {

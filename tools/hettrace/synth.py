@@ -139,6 +139,37 @@ def gen_cooperative(directory, n_per_src=200):
     return directory
 
 
+def gen_bar_pair(directory, n=100):
+    """健康形态，但只有两个源：host 与 Vortex 经 BAR 交接，不碰 shared_buffer。
+
+    这是 run_vortex_shared.sh 的形态 —— vecadd 走 CP 提交路径，字节全在设备内存
+    里，host 只能经 vortex_bar 碰到它们。validate 必须放行：交接区不是同一个，
+    但交接是真的。
+    """
+    bar = addrmap.REGIONS["vortex_bar"][0]
+    period = {n_: addrmap.SOURCES[n_][3] for n_ in ("host", "vortex")}
+
+    # host 分两相：先经 BAR 把输入上传完，等设备跑完再经 BAR 读回结果。分相而不是
+    # 交错，是因为记录必须按 tick 单调 —— 交错写法会让第 i+1 次上传的时间戳早于第
+    # i 次读回，validate 会（正确地）报成 tick 回退。
+    h = SynthWriter(directory, "host")
+    for i in range(n):
+        h.emit(1000 + i * 10 * period["host"], bar + 0x10000 + i * 64, 64, OP_WRITE)
+    for i in range(n):
+        h.emit(1000 + (n * 10 + i * 10) * period["host"],
+               bar + 0x20000 + i * 64, 64, OP_READ)
+    h.close()
+
+    v = SynthWriter(directory, "vortex")
+    for i in range(n):
+        base = 3000 + i * 12 * period["vortex"]
+        v.emit(base, bar + 0x10000 + i * 64, 64, OP_READ, ctx=i % 8)
+        v.emit(base + 2 * period["vortex"], bar + 0x20000 + i * 64, 64, OP_WRITE,
+               ctx=i % 8)
+    v.close()
+    return directory
+
+
 def gen_broken_no_sharing(directory, n=100):
     """失效形态：三个源各干各的，共享区无人触及。validate 必须报 ERROR。"""
     for name, reg in (("host", "host_heap"), ("vortex", "vortex_vram"),
