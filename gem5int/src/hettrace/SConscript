@@ -1,0 +1,15 @@
+# -*- mode:python -*-
+#
+# host 侧 hettrace tap。装进 $GEM5_HOME/src/hettrace/ 由 gem5int/install.sh
+# 完成；gem5 的顶层 SConstruct 会自动递归到本文件。
+#
+# 这个目录里还有 libhettrace 的头（addrmap.h / record.h / writer.h，同样由
+# install.sh 拷入）。它们是 header-only，不需要在这里 Source()，靠 gem5 把 src/
+# 作为 include 根来解析 #include "hettrace/writer.h"。
+#
+# 真值源: gem5int/src/hettrace/SConscript
+
+Import('*')
+
+SimObject('HetTraceProbe.py', sim_objects=['HetTraceProbe'])
+Source('het_trace.cc')

@@ -1,0 +1,208 @@
+# 三棵树怎么接起来
+
+本项目不 fork gem5、Vortex、CoralNPU 中的任何一棵，而是把自己的东西**装进**它们的树里。
+本文件说清楚谁装到哪、为什么这么装、以及补丁打不上时怎么办。
+
+## 四棵树
+
+| 树 | 环境变量 | 里面放了什么 |
+|---|---|---|
+| 本项目 | — | 所有 source-of-truth |
+| gem5 | `GEM5_HOME` | `src/dev/coralnpu/`、`src/hettrace/`、`src/dev/vortex/`、`configs/het/` |
+| Vortex | `VORTEX_HOME` | `sim/simx/hettrace/`、`sim/simx/gem5/vortex_trace.h`、5 个补丁 |
+| CoralNPU | `CORALNPU_HOME` | `gem5int/` 整个 package、2 个补丁 |
+
+三个安装脚本都是**幂等**的（重跑只刷新文件、已打过的补丁会跳过）且都支持 `--revert`。
+
+```bash
+GEM5_HOME=$HOME/gem5                     ./gem5int/install.sh
+VORTEX_HOME=$HOME/vortex-gpu/vortex      ./vortexint/install.sh
+CORALNPU_HOME=$HOME/coralnpu             ./coralnpuint/install.sh
+```
+
+## 两种安装方式，以及为什么不统一
+
+**新目录（首选）**：gem5 侧的 `src/dev/coralnpu/`、`src/hettrace/`、`configs/het/`，
+CoralNPU 侧的 `gem5int/`。这几处一个上游文件都不碰，所以"上游改了文件导致补丁打不上"这个
+失效模式**根本不存在**，`--revert` 也就只是 `rm -rf`，不需要备份还原。
+
+这么做是可行的，因为三套构建系统都会自动发现新目录：
+
+* gem5 的 `SConstruct` 递归查找 `src/**/SConscript`；
+* bazel 把每个带 `BUILD` 的目录当作一个 package；
+* SimX 的 Makefile 已有 `-I$(SRC_DIR)`（即 `sim/simx`），所以 hettrace 的头装在
+  `sim/simx/hettrace/` 下面就能被 `#include <hettrace/writer.h>` 找到。
+
+**补丁（不得已）**：只有 7 个文件必须改，每一个都有非它不可的理由。
+
+| 树 | 文件 | 为什么必须改 |
+|---|---|---|
+| CoralNPU | `hw_sim/core_mini_axi_wrapper.h` | 加 `halted()` / `wfi()` 两个非阻塞访问器。那两个状态位是 `private`，而现成的 `WaitForTermination()` 会自己推时钟 —— 在 gem5 里用它就破坏"时钟只由 gem5 推"这条不变量 |
+| CoralNPU | `hw_sim/BUILD` | 把 `core_mini_axi_wrapper` 的 visibility 放到 public，否则 `//gem5int` 依赖不到 |
+| Vortex | `sim/simx/gem5/vortex_gpgpu.{h,cpp}` | 设备库侧新增 `vortex_gem5_trace_*` 三个 ABI 函数 |
+| Vortex | `sim/simx/gem5/vortex_gpgpu_dev.{hh,cc}` | gem5 侧 dlsym 可选解析这三个函数，并把 `curTick()` 作为时间源递进去 |
+| Vortex | `sim/simx/gem5/VortexGPGPU.py` | 两个参数：`trace_enable` / `trace_addr_offset` |
+
+Vortex 那 5 个补丁全是**纯增量**的：新 ABI 由 gem5 侧用 `dlsym` 可选解析且解析失败不
+fatal，所以没打过补丁的 `libvortex-gem5.so` 照样能被加载，只是没有 trace。
+
+`gem5int/install.sh` 不装 Vortex 的 gem5 SimObject：那份源码的 source-of-truth 在 Vortex
+树里（`sim/simx/gem5/`），由 Vortex 自己的 `install.sh` 装进 gem5。所以 Vortex 那条腿要跑
+**两个**安装脚本，顺序不能反：
+
+```bash
+VORTEX_HOME=$HOME/vortex-gpu/vortex ./vortexint/install.sh      # 先打补丁
+GEM5_HOME=$HOME/gem5 $VORTEX_HOME/sim/simx/gem5/install.sh      # 再把打过补丁的源码装进 gem5
+```
+
+反了的话 gem5 里装的是打补丁**前**的 `VortexGPGPU.py`，编出来的 gem5 没有 `trace_enable`
+参数，而配置脚本会在设置这个参数时报一个"看不出与安装顺序有关"的错。`run_vortex.sh` 第一
+件事就是检查 `build/X86/params/VortexGPGPU.hh` 里有没有 `trace_enable`，正是为了把这个失
+效模式挡在前面。
+
+## 补丁打不上怎么办
+
+安装脚本用 `patch -R --dry-run` 判断状态（能反向应用 = 已经打过了），打不上时报的是：
+
+```
+错误: hw_sim/xxx 的补丁无法应用 —— 上游大概改过这个文件。
+      需要重新生成 xxx.patch（见 docs/04-integration.md）。
+```
+
+重新生成的做法：补丁都是 `-p0` 的单文件 unified diff，头部形如
+`--- core_mini_axi_wrapper.h` / `+++ core_mini_axi_wrapper.h`（**没有** `a/` `b/` 前缀）。
+
+```bash
+cd $CORALNPU_HOME/hw_sim
+cp core_mini_axi_wrapper.h.pre-hettrace /tmp/orig.h     # 上一次的原文件备份
+# 手工把改动搬到新版本的上游文件上，然后：
+diff -u /tmp/orig.h core_mini_axi_wrapper.h > $PROJ/coralnpuint/patches/core_mini_axi_wrapper.h.patch
+```
+
+`diff -u` 出来的头部路径要手工改成不带目录的裸文件名，`-p0` 才能配合脚本里
+`patch -p0 ... "$HW_SIM_DIR/$f"` 的用法。首次打补丁时脚本会把原文件存成
+`<name>.pre-hettrace`（`cp -n`，不会覆盖已有备份），所以总有一份"上游原样"可比。
+
+## 构建
+
+### gem5
+
+```bash
+scons -C $GEM5_HOME build/X86/gem5.opt -j$(nproc)
+```
+
+编完之后核对一下东西是否真的进去了 —— 这比"编译通过"靠得住，因为漏装一个 `.py` 只会让
+参数消失，不会让编译失败：
+
+```bash
+nm -C $GEM5_HOME/build/X86/gem5.opt | grep -c 'gem5::CoralNPU::'          # 应 > 0
+grep -n trace_enable $GEM5_HOME/build/X86/params/CoralNPU.hh              # 应有
+grep -n trace_enable $GEM5_HOME/build/X86/params/VortexGPGPU.hh           # 应有
+```
+
+`params/*.hh` 是 SCons 从 `.py` 生成的，所以它是"`.py` 装对了没有"的直接证据。改过
+`.py` 之后必须重编：残留的 `build/` 里既有旧的 `.o` 也有旧的生成头。
+
+### CoralNPU 设备库
+
+```bash
+cd $CORALNPU_HOME
+bazel build //gem5int:libcoralnpu-gem5.so     # 产物 bazel-bin/gem5int/libcoralnpu-gem5.so
+bazel build //gem5int:ddr_touch.elf           # 验证内核
+```
+
+`libcoralnpu-gem5-rvv.so` 是带向量单元的变体，ABI 完全相同，gem5 侧不需要知道自己 dlopen
+的是哪一个（`coralnpu_gem5_build_info()` 会说）。内核用到 RVV 时换这个。
+
+注意 `ddr_touch.elf` 的产物路径在 `bazel-out/` 下面，而 `bazel-out` 是符号链接 —— `find`
+默认不跟进符号链接，所以测试脚本里先 `readlink -f` 再 find。
+
+### Vortex
+
+Vortex 是三棵树里最麻烦的一棵，因为它的 `third_party` 是 git submodule，而默认 checkout
+下来是空目录：
+
+```bash
+cd $VORTEX_HOME
+git submodule update --init third_party/softfloat third_party/ramulator third_party/cocogfx
+make -C $VORTEX_HOME/third_party -j$(nproc)
+```
+
+不做这一步的话，编 SimX 会以 `softfloat.h: No such file or directory` 之类的形式失败 ——
+报的是缺头文件，看不出是 submodule 没拉。
+
+然后配置并编设备库。`USE_GEM5=1` 不能省：默认目标只编 `simx` 可执行文件，**不编**
+`libvortex-gem5.so`。
+
+```bash
+mkdir -p /tmp/vxbuild && cd /tmp/vxbuild
+$VORTEX_HOME/configure --xlen=32
+make -C /tmp/vxbuild/sim/simx USE_GEM5=1 libvortex-gem5 -j$(nproc)
+nm -D --defined-only /tmp/vxbuild/sim/simx/libvortex-gem5.so | grep vortex_gem5_trace_
+```
+
+最后那行是 tap 是否真的编进去了的判据，应看到三个符号：`vortex_gem5_trace_open` /
+`_close` / `_emitted`。
+
+**运行时有一个坑**：`libvortex-gem5.so` 链的是 Vortex 自带的
+`third_party/ramulator/libramulator.so`，`.so` 里有正确的 `RUNPATH`。但 `RUNPATH` 的搜索
+顺序在 `LD_LIBRARY_PATH` **之后**，所以机器上别处若还装了一个 ramulator2（它是个独立项
+目，很常见）且在 `LD_LIBRARY_PATH` 里，那份会被抢先加载，gem5 在 dlopen 时死在：
+
+```
+undefined symbol: _ZN9Ramulator7Logging19_create_base_loggerEv
+```
+
+这个报错完全看不出与 ramulator 版本有关。解法是把 Vortex 自带的那份放到最前面：
+
+```bash
+export LD_LIBRARY_PATH=$VORTEX_HOME/third_party/ramulator:$LD_LIBRARY_PATH
+```
+
+`run_vortex.sh` 自己做了这件事并在做不到时给出明确的错误。
+
+### Vortex 的 RISC-V 工具链（可选，用于 `.vxbin`）
+
+上面这套**不需要** RISC-V 工具链 —— `run_vortex.sh` 用的内核是手写的裸机 rv32im 平坦镜像
+（`workloads/vortex_smoke/kernel.S`），用系统自带的 multilib `riscv64-unknown-elf-gcc` 就
+能编，`vortex_gem5_load_kernel` 的 flat-image 路径接受 `.bin`。
+
+但**只有** `.vxbin` 才能走 CP 驱动的启动路径，也就是 host ↔ Vortex 真正交换字节所必需的那
+条路（见 [03-limitations.md](03-limitations.md)）。要编 `.vxbin` 需要 Vortex 的 LLVM 工具
+链，装法是 Vortex 自己的：
+
+```bash
+cd $VORTEX_HOME
+./ci/toolchain_install.sh --all       # 下载 llvm-vortex / libc32 / libcrt32 到 $TOOLDIR
+```
+
+需要网络且体积不小。装好之后 `make -C /tmp/vxbuild/tests/kernel` 之类的目标会产出
+`.vxbin`，把它传给 `het_system.py` 的 `--vortex-kernel` 即可。
+
+## 跑测试
+
+```bash
+# host + CoralNPU 协同（含反向对照）—— 本项目的主验收
+GEM5_HOME=$HOME/gem5 CORALNPU_HOME=$HOME/coralnpu gem5int/tests/run_het.sh
+
+# CoralNPU 单设备
+GEM5_HOME=$HOME/gem5 CORALNPU_HOME=$HOME/coralnpu gem5int/tests/run_gem5_npu.sh
+
+# Vortex 单设备（tap 验收）
+GEM5_HOME=$HOME/gem5 VORTEX_HOME=$HOME/vortex-gpu/vortex VORTEX_BUILD=/tmp/vxbuild \
+    gem5int/tests/run_vortex.sh
+
+# 不需要任何仿真器的检查（addrmap 同步性 + 165 项自测）
+make check
+
+# CoralNPU 设备库的纯 C 冒烟测试（不经 gem5）
+CORALNPU_HOME=$HOME/coralnpu coralnpuint/tests/run_smoke.sh
+```
+
+`make check` = `gen_addrmap.py --check` + `tools/tests/test_tools.py`（102 项）+
+`libhettrace/tests/test_writer.cc`（63 项）。两套自测都不用 pytest / gtest，各自数检查项、
+各自定退出码 —— 少两个依赖，在只有 gem5 自带 python 的机器上也能跑。
+
+`gen_addrmap.py --check` 只校验生成物是否与 `addrmap.json` 同步，不写文件，适合放在 CI 的
+最前面 —— 生成物过期会让 C++ 侧和 Python 侧对"哪个地址属于哪个区域"的判断不一致，那种错
+误在别处表现得非常隐晦。
