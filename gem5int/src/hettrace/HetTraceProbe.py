@@ -28,10 +28,15 @@ class HetTraceProbe(BaseMemProbe):
     # host 与设备看到的物理地址不一致的配置。
     trace_addr_offset = Param.Int64(0, "记录前加到地址上的偏移")
 
-    # 取指流量。默认记 —— host 的取指同样会打到 DRAM，是真实带宽的一部分，
-    # 而且记录里带 kFlagInstr 标记，下游想只看数据流量随时能滤掉。关掉它是为了
-    # 和只统计数据访存的分析对齐。
-    trace_inst_fetch = Param.Bool(True, "把取指流量也记进 trace")
+    # 取指流量。默认**不**记，与 het_system.py 的 --host-trace-inst 保持一致
+    # （那个开关默认关）—— 两处默认值不一致的话，直接 HetTraceProbe() 建出来的
+    # 探针会比本项目跑出来的所有 trace 多好几倍记录，而条数对不上是最难查的一
+    # 类差异。
+    #
+    # 取指确实是真实 DRAM 流量，记进来并不错，而且记录带 kFlagInstr 标记，下游
+    # 随时能分开看。默认关掉纯粹是因为它把记录数翻好几倍，而本项目要回答的问题
+    # （三个源有没有碰同一段数据）用不到它。
+    trace_inst_fetch = Param.Bool(False, "把取指流量也记进 trace")
 
     # BaseMemProbe 的 probe_name 默认是 "PktRequest"，正是我们要的：
     # 内存控制器/末级 cache 的 mem_side 发出的请求。这里不覆盖它。

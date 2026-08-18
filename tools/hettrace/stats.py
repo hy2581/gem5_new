@@ -21,6 +21,10 @@ def bandwidth_timeline(directory, window_ticks):
     带宽是 trace-driven 下最可信的量：它只依赖"哪些地址被访问了多少字节"，
     不依赖请求发出的精确时刻是否受争抢影响。
     """
+    # window_ticks<=0 时下面的 start = end 永远推不动窗口 —— 表现是静默卡死，
+    # 不是异常。CLI 已在参数层挡了一道，这里再挡一道给直接调库的人。
+    if window_ticks <= 0:
+        raise ValueError("window_ticks 必须为正，收到 %r" % (window_ticks,))
     entries = discover(directory)
     if not entries:
         return [], []
@@ -61,6 +65,8 @@ def footprint(directory, line_bytes=64):
 
     共享 line 数是"异构协同是否真实发生"的定量证据 —— 比看区域分布更硬。
     """
+    if line_bytes <= 0:
+        raise ValueError("line_bytes 必须为正，收到 %r" % (line_bytes,))
     entries = discover(directory)
     lines = {}
     for path, hdr in entries:

@@ -59,7 +59,9 @@ ls -la "$OUT"
 if compgen -G "$OUT/*.hettrace" > /dev/null; then
     echo
     echo "---- hettrace validate ----"
-    echo "注: 这里只跑了 CoralNPU 一个源，validate 报"只有 1 个源"是预期的 ——"
+    # 单引号：句子里带引号，写成双引号会被 shell 吃掉那两个引号（引号内外拼接，
+    # 不报错、只是引号消失），读 log 的人反而以为工具输出的是别的话。
+    echo '注: 这里只跑了 CoralNPU 一个源，validate 报"只有 1 个源"是预期的 ——'
     echo "    它在提醒你这不是异构 trace，而不是说这份 trace 本身有问题。"
     echo
     export PYTHONPATH="$PROJ_DIR/tools${PYTHONPATH:+:$PYTHONPATH}"

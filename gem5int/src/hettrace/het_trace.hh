@@ -58,8 +58,11 @@ class HetTraceProbe : public BaseMemProbe
     const std::string srcName_;
     const bool        enable_;
     const int64_t     addrOffset_;
-    // 取指流量。默认记：host 的取指同样会打到 DRAM，是真实带宽的一部分。
-    // 关掉它是为了和只看数据流量的分析对齐。
+    // 取指流量。默认**不**记（HetTraceProbe.py 与 het_system.py 的
+    // --host-trace-inst 两处默认值一致）。host 的取指确实会打到 DRAM，是真实带宽
+    // 的一部分，记进来并不错、而且带 kFlagInstr 标记可以事后分开看；默认关掉纯粹
+    // 因为它把记录数翻好几倍，而本项目要回答的问题（三个源有没有碰同一段数据）
+    // 用不到它。
     const bool        traceInstFetch_;
     bool              active_;
 };

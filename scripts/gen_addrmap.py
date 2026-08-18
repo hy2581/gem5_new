@@ -91,6 +91,17 @@ def validate(m):
     for s in m["sources"]:
         if s["level"] not in LEVELS:
             errs.append("source %s 的 level %r 未知" % (s["name"], s["level"]))
+        # clock_period_ticks 是整除算出来的。除不尽的话（比如 1500 MHz 配 1e12
+        # tick/s）两侧生成的都是那个被截断的值，validate 拿它和自己比对当然一致
+        # —— 错误不会被任何检查抓到，只会让下游把 tick 折算成周期时慢慢偏掉。
+        # 所以在生成阶段就禁掉除不尽的时钟。
+        hz = s["clock_mhz"] * 1000000
+        if hz <= 0 or m["ticks_per_second"] % hz != 0:
+            errs.append(
+                "source %s 的 clock_mhz=%s 除不尽 ticks_per_second=%d —— "
+                "clock_period_ticks 会被静默截断"
+                % (s["name"], s["clock_mhz"], m["ticks_per_second"])
+            )
 
     for r in m["regions"]:
         for acc in r["accessors"]:
@@ -308,7 +319,6 @@ def gen_py(m):
     a("")
     a("DRAM_WINDOW = (0x%X, 0x%X)" % (m["dram_window"]["base_i"], m["dram_window"]["size_i"]))
     a("")
-    a("# HETTRACE_FILTER=dram 时 writer 记录的窗口 —— 比 DRAM_WINDOW 多一个 vortex_bar。")
     a("# %s" % m["trace_windows"]["note"].replace("\n", " "))
     a("TRACE_WINDOWS = (")
     for name, base, size in trace_windows(m):

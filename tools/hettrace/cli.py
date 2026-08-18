@@ -10,10 +10,31 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from . import addrmap, convert as convert_mod, merge, stats, validate
 from .reader import OP_WRITE, TraceError, read_header, read_meta, read_records
+
+
+def _positive_int(s):
+    """argparse 类型：必须为正。
+
+    0 不是"没有限制"而是死循环 / 除零：--window 0 会让 bandwidth_timeline 的
+    窗口永远推不动，--line 0 会在 footprint 里除零。这两个都出现过，所以在
+    参数层就挡掉，而不是等到跑起来。
+    """
+    v = int(s)
+    if v <= 0:
+        raise argparse.ArgumentTypeError("必须是正整数，收到 %r" % s)
+    return v
+
+
+def _nonneg_int(s):
+    v = int(s)
+    if v < 0:
+        raise argparse.ArgumentTypeError("不能为负，收到 %r" % s)
+    return v
 
 
 def cmd_validate(args):
@@ -120,8 +141,15 @@ def cmd_convert(args):
             tok = tok.strip()
             if tok in addrmap.SOURCES:
                 srcs.add(addrmap.SOURCES[tok][0])
-            else:
-                srcs.add(int(tok))
+                continue
+            try:
+                srcs.add(int(tok, 0))
+            except ValueError:
+                sys.stderr.write(
+                    "--sources 里的 %r 既不是源名也不是数字 id。可用源名: %s\n"
+                    % (tok, ", ".join(sorted(addrmap.SOURCES)))
+                )
+                return 1
 
     records, entries = merge.merge_dir(args.trace_dir)
     if not entries:
@@ -156,14 +184,15 @@ def build_parser():
     s = sub.add_parser("stats", help="带宽 / footprint / 共享度统计")
     s.add_argument("trace_dir")
     s.add_argument(
-        "--window", type=int, default=1000000,
+        "--window", type=_positive_int, default=1000000,
         help="带宽窗口 tick 数，默认 1e6 (=1us)")
-    s.add_argument("--line", type=int, default=64, help="cache line 字节数")
+    s.add_argument("--line", type=_positive_int, default=64,
+                   help="cache line 字节数")
     s.set_defaults(func=cmd_stats)
 
     d = sub.add_parser("dump", help="人读单个 trace 文件")
     d.add_argument("trace_file")
-    d.add_argument("-n", "--count", type=int, default=50,
+    d.add_argument("-n", "--count", type=_nonneg_int, default=50,
                    help="最多打印多少条，0 表示全部")
     d.set_defaults(func=cmd_dump)
 
@@ -189,7 +218,33 @@ def main(argv=None):
         return cmd_convert(args)
     if args.cmd == "convert" and not args.trace_dir:
         p.error("convert 需要 trace_dir（或用 --list-presets）")
-    return args.func(args)
+
+    try:
+        return args.func(args)
+    except TraceError as e:
+        # 截断的 trace 是 read_records 在流中途才发现的（尾部残余字节），所以
+        # 这个异常可以从 merge / stats / convert / dump 的任何一处冒出来。它是
+        # 本工具**预期要检测**的失效形态，用 traceback 报出来只会让人以为是工具
+        # 自己崩了 —— 而且 merge/convert 此时已经写出了一部分内容。
+        sys.stderr.write("hettrace: %s\n" % e)
+        sys.stderr.write(
+            "         先跑 hettrace validate 看是哪个源出的问题。"
+            "merge / convert 此前写出的内容是残缺的，不要使用。\n"
+        )
+        return 1
+    except BrokenPipeError:
+        # `hettrace merge dir | head` 的正常收场。必须排在 OSError 之前 ——
+        # BrokenPipeError 是它的子类。按 CPython 官方建议把 stdout 重定向到
+        # devnull，否则解释器退出时刷缓冲还会再抛一次，屏幕上留下
+        # "Exception ignored in: <_io.TextIOWrapper name='<stdout>'>"。
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 1
+    except OSError as e:
+        sys.stderr.write("hettrace: %s\n" % e)
+        return 1
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

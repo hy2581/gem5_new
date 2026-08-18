@@ -283,7 +283,12 @@ void
 CoralNPU::loadAndStart()
 {
     if (started_) {
-        warn("CoralNPU: start requested but the kernel is already running");
+        // Covers both "still running" and "already finished": start is
+        // one-shot for the lifetime of the device (see tick()).
+        warn("CoralNPU: start ignored — the kernel has already been started "
+             "once (halted=%d, ticking=%d); start is one-shot",
+             static_cast<int>(abi_.halted(deviceHandle_)),
+             static_cast<int>(tickEvent_.scheduled()));
         return;
     }
     started_ = true;
@@ -315,8 +320,13 @@ CoralNPU::tick()
         closeTrace();
         exitSimLoop("CoralNPU: kernel complete");
     }
-    // Otherwise: stay dormant. The host polls REG_STATUS / the mailbox and can
-    // re-arm us with another REG_CTRL write.
+    // Otherwise: stay dormant and let the host collect the result by polling
+    // REG_STATUS / reading the mailbox.
+    //
+    // Dormant is terminal: start is one-shot, so a second REG_CTRL write is
+    // refused with a warning rather than restarting a halted core from a
+    // state this project has never verified (see loadAndStart). One kernel
+    // per device per gem5 run.
 }
 
 // ---- PIO -------------------------------------------------------------------

@@ -206,7 +206,13 @@ for want in "交接区 shared_buffer 被 host, coralnpu 共同访问" \
 done
 # 区间不相交会被 validate 报成 WARN。第 3 步已经直接判过，这里再顺手确认报告里干净
 # —— 免得将来 validate 换了判据而脚本还以为自己在守着这条性质。
-grep -q "时间区间不重叠" "$OUT/validate.txt" && fail "validate 报了区间不重叠"
+#
+# 写成 if 而不是 `grep -q ... && fail`：那种写法在 set -e 下能跑对纯属巧合 ——
+# grep 没匹配时整条 AND 列表的退出码是 1，一旦它挪到脚本末尾就会让整个脚本以 1
+# 退出，而屏幕上什么错都没有。
+if grep -q "时间区间不重叠" "$OUT/validate.txt"; then
+    fail "validate 报了区间不重叠"
+fi
 
 python3 - "$OUT" <<'PY' || exit 1
 import sys

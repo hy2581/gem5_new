@@ -19,10 +19,19 @@
 #
 # ---- BAR 的取舍 ----
 #
-# pin_size 默认是 0（BAR 关掉）。这里显式打开并把 pin_addr 覆盖成 0xa0000000：
-# 上游默认的 0x100000000 在 4 GiB 之上，CoralNPU 的 32 位 AXI 连表达都做不到，
-# 统一地址空间里不允许出现这种地址（docs/01-address-map.md 的硬约束 1）。本脚本
-# 里没有 CoralNPU，但地址图是全工程共用的一张，不能因为"这次用不到"就放宽。
+# pin_size 默认是 0（BAR 关掉）。这里显式打开，并把 pin_addr 放在 0xa0000000
+# 而不是上游默认的 0x100000000。
+#
+# 这么做**只在本脚本里成立**，别照抄到 het_system.py：pin_addr/pin_size 不是自由
+# 参数，Vortex 的 host runtime（sw/runtime/gem5/driver.h）把
+# PIN_BASE_ADDR=0x100000000、PIN_REGION_SIZE=0x100000000 写成了 constexpr，改了这
+# 边不改那边，host 的写会静默落到别的设备地址上（docs/01-address-map.md 硬约束 1）。
+# 本脚本里根本没有 host runtime —— standalone 模式下内核由设备自己 preload，
+# kernel.S 直接用设备地址 0xa0000000 —— 所以那条约束在这里没有约束对象，BAR 摆在
+# 哪儿都不影响结果，摆低一点只是让整个配置留在 32 位地址内、看 log 时省心。
+#
+# tap 记的是设备地址（trace_addr_offset=0），与 pin_addr 无关，所以记录落在
+# addrmap.json 的 vortex_vram 区间里，不是 vortex_bar。
 
 import argparse
 import os

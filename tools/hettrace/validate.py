@@ -247,13 +247,20 @@ def _cross_source_checks(summaries):
                 Issue("INFO", "-", "交接区 %s 被 %s 共同访问" % (reg, ", ".join(touchers)))
             )
     if not found:
+        # 候选区里有一部分在默认过滤器（HETTRACE_FILTER=dram，判据是
+        # trace_windows）下压根不可能出现 —— npu_mailbox 就是：它是控制面寄存器，
+        # 落在窗口之外，writer 从不记它。把它当"你该去看看那儿"的线索列出来，只会
+        # 让人白查一圈，所以显式标注出来。
+        cands = []
+        for reg in addrmap.HANDOFF_REGIONS:
+            base = addrmap.REGIONS[reg][0]
+            cands.append(reg if addrmap.is_traced(base) else reg + "(不在过滤窗口内)")
         issues.append(
             Issue(
                 "ERROR",
                 "-",
                 "没有任何交接区被两个以上的源触及（候选：%s）—— 负载没有真正的"
-                "跨设备数据交接，trace 退化为几条不相干的流"
-                % ", ".join(addrmap.HANDOFF_REGIONS),
+                "跨设备数据交接，trace 退化为几条不相干的流" % ", ".join(cands),
             )
         )
 

@@ -39,7 +39,6 @@ REGIONS = {
 
 DRAM_WINDOW = (0x80000000, 0x40000000)
 
-# HETTRACE_FILTER=dram 时 writer 记录的窗口 —— 比 DRAM_WINDOW 多一个 vortex_bar。
 # HETTRACE_FILTER=dram 时 writer 只记录落在这些窗口里的访问。它比 dram_window 多一个 vortex_bar：过滤器要挡掉的是 core-local 命中与 MMIO 寄存器读写，而经 BAR 走的访问是真实的内存流量，两侧（host 与 vortex）都必须留下才能对出共享字节。dram_window 本身的含义不动 —— IsDram() 仍然只表示 CoralNPU 的 DDR 判定。
 TRACE_WINDOWS = (
     ("dram_window", 0x80000000, 0x40000000),

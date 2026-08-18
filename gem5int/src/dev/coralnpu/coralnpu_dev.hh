@@ -64,7 +64,8 @@ private:
     // shared buffer and the mailbox, not through these.
     enum Reg : Addr
     {
-        REG_CTRL     = 0x00,  // W: bit0 = start kernel
+        REG_CTRL     = 0x00,  // W: bit0 = start kernel (one-shot; a second
+                              //    write is refused with a warning)
         REG_STATUS   = 0x04,  // R: bit0 halted, bit1 wfi, bit2 ticking
         REG_ENTRY    = 0x08,  // R: entry PC reported by load_elf
         REG_EMITTED  = 0x0c,  // R: trace records written so far (low 32b)
@@ -78,6 +79,12 @@ private:
     // Load the ELF and pulse the ctrl register. Both use the library's
     // blocking AXI-slave path, which advances CoralNPU's clock internally --
     // legal only before the first tick is scheduled. Called from startup().
+    //
+    // Start is one-shot: started_ is never cleared, so once the kernel has
+    // been launched -- and also once it has halted -- a further REG_CTRL
+    // write is refused with a warning. Restarting a halted CoreMiniAxi core
+    // by pulsing ctrl again is not something this project has verified, and
+    // refusing loudly beats re-running from an unknown core state.
     void loadAndStart();
 
     // Memory-access tracing (hettrace) --------------------------------

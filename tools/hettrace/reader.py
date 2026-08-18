@@ -26,6 +26,10 @@ FLAG_BURST_BEAT = 1 << 0
 FLAG_PREFETCH = 1 << 1
 FLAG_UNMAPPED = 1 << 2
 FLAG_INSTR = 1 << 3
+# Vortex 的 CP DMA 走这一位（vortexint/vortex_trace.h）。真 trace 里 vortex 源
+# 大半的记录都带它 —— 少了这个常量，任何想按"核 vs 搬运引擎"分开看的代码都得
+# 自己写死 16，而 record.h 一改就没人发现。
+FLAG_DMA = 1 << 4
 
 OP_READ = 0
 OP_WRITE = 1

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +20,7 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from hettrace import addrmap, convert, merge, stats, synth, validate  # noqa: E402
+from hettrace import addrmap, convert, merge, reader, stats, synth, validate  # noqa: E402
 from hettrace.reader import (  # noqa: E402
     OP_READ,
     OP_WRITE,
@@ -105,6 +106,40 @@ def test_addrmap_invariants():
 # ---------------------------------------------------------------------------
 # 读取与归并
 # ---------------------------------------------------------------------------
+
+def test_flag_bits_match_cpp():
+    """reader.py 的 FLAG_* 必须与 record.h 的 kFlag* 逐位一致。
+
+    格式常量在两侧各写了一遍（Python 侧不 include C++ 头），而 flags 是唯一没有
+    被 gen_addrmap.py 生成、也不会在 writer 交叉验证里被检查的一组常量 —— 它们
+    只在"按 flag 分类记录"时才起作用，错一位的后果是分类静默错位，没有任何报错。
+    所以在这里直接从头文件里把值抠出来比。
+    """
+    h = os.path.join(ROOT, "libhettrace", "include", "hettrace", "record.h")
+    with open(h) as f:
+        text = f.read()
+    cpp = dict(re.findall(r"constexpr uint8_t kFlag(\w+)\s*=\s*1u\s*<<\s*(\d+)", text))
+    check(len(cpp) >= 5, "record.h 里应能抠出 5 个以上 kFlag，实为 %r" % (cpp,))
+
+    # kFlagBurstBeat -> FLAG_BURST_BEAT
+    def to_py(name):
+        return "FLAG_" + re.sub(r"(?<!^)(?=[A-Z])", "_", name).upper()
+
+    for name, bit in cpp.items():
+        py_name = to_py(name)
+        py_val = getattr(reader, py_name, None)
+        check(py_val is not None,
+              "reader.py 缺少 %s（record.h 里有 kFlag%s）" % (py_name, name))
+        if py_val is not None:
+            check(py_val == 1 << int(bit),
+                  "%s 应为 1<<%s，实为 %r" % (py_name, bit, py_val))
+
+    # 反向：Python 侧不该有 C++ 侧没有的位，否则是删了 C++ 定义没同步
+    for py_name in [k for k in dir(reader) if k.startswith("FLAG_")]:
+        want = {to_py(n) for n in cpp}
+        check(py_name in want,
+              "reader.py 的 %s 在 record.h 里没有对应的 kFlag" % py_name)
+
 
 def test_synth_roundtrip():
     d = tmpdir()
@@ -415,6 +450,96 @@ def test_cli_end_to_end():
             check(r.returncode != 0, "坏 trace 应让 validate 非零退出")
         finally:
             shutil.rmtree(d2)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_cli_rejects_bad_args():
+    """坏参数与坏文件必须换来干净的错误信息，不是 traceback、更不是卡死。
+
+    这四种情形都曾经真的出过：--line 0 除零、--window 0 静默死循环（窗口永远推
+    不动，表现是卡住而不是报错）、--sources 打错名字抛 ValueError、截断的 trace
+    让 TraceError 一路冒到栈顶。它们都是**用户输入**，工具崩在这上面等于把"你输
+    错了"报成"工具坏了"，所以每一种都在这里钉住。
+
+    每个子进程都带 timeout：死循环那一类的回归只有超时能抓到。
+    """
+    d = tmpdir()
+    try:
+        synth.gen_cooperative(d, n_per_src=20)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.join(ROOT, "tools")
+
+        def run(args):
+            try:
+                return subprocess.run(
+                    [sys.executable, "-m", "hettrace"] + args,
+                    capture_output=True, text=True, env=env, cwd=ROOT,
+                    timeout=60,
+                )
+            except subprocess.TimeoutExpired:
+                return None
+
+        # 非法参数：argparse 层就该挡掉（rc=2）
+        for args in (
+            ["stats", d, "--window", "0"],
+            ["stats", d, "--line", "0"],
+            ["stats", d, "--window", "-1"],
+            ["stats", d, "-n", "-1"],
+        ):
+            r = run(args)
+            check(r is not None,
+                  "hettrace %s 卡死了（超时）" % " ".join(args[1:]))
+            if r is None:
+                continue
+            check(r.returncode == 2,
+                  "hettrace %s 应以 2 退出（argparse），实为 %d"
+                  % (" ".join(args[1:]), r.returncode))
+            check("Traceback" not in r.stderr,
+                  "hettrace %s 不应打 traceback:\n%s"
+                  % (" ".join(args[1:]), r.stderr))
+
+        # 认不出的源名：给出可用源名，不是 ValueError
+        r = run(["convert", d, "--sources", "nosuch"])
+        check(r is not None and r.returncode == 1,
+              "--sources nosuch 应以 1 退出，实为 %r"
+              % (None if r is None else r.returncode))
+        if r is not None:
+            check("Traceback" not in r.stderr,
+                  "--sources nosuch 不应打 traceback:\n%s" % r.stderr)
+            check("coralnpu" in r.stderr,
+                  "--sources 的错误信息里应列出可用源名:\n%s" % r.stderr)
+
+        # 源名与数字 id 混用仍应正常工作
+        r = run(["convert", d, "--sources", "vortex,2", "--preset", "timed"])
+        check(r is not None and r.returncode == 0,
+              "--sources vortex,2 应正常工作，实为 %r"
+              % (None if r is None else r.returncode))
+    finally:
+        shutil.rmtree(d)
+
+    # 截断的 trace：这是本工具**预期要检测**的失效形态，必须报得干净
+    d = tmpdir()
+    try:
+        synth.gen_cooperative(d, n_per_src=20)
+        p = os.path.join(d, "host.hettrace")
+        with open(p, "r+b") as f:
+            f.truncate(os.path.getsize(p) - 13)  # 半条记录
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.join(ROOT, "tools")
+        for args in (["merge", d], ["stats", d], ["dump", p]):
+            r = subprocess.run(
+                [sys.executable, "-m", "hettrace"] + args,
+                capture_output=True, text=True, env=env, cwd=ROOT, timeout=60,
+            )
+            check(r.returncode == 1,
+                  "截断的 trace 应让 hettrace %s 以 1 退出，实为 %d"
+                  % (args[0], r.returncode))
+            check("Traceback" not in r.stderr,
+                  "截断的 trace 不应打 traceback (%s):\n%s" % (args[0], r.stderr))
+            check("hettrace:" in r.stderr,
+                  "截断的 trace 应给出 hettrace: 前缀的信息 (%s):\n%s"
+                  % (args[0], r.stderr))
     finally:
         shutil.rmtree(d)
 
