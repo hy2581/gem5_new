@@ -23,7 +23,7 @@ help:
 	@echo "make check-addrmap  - 只校验生成物是否过期，不写文件"
 	@echo "make test           - test-tools + test-writer"
 	@echo "make install        - 把本项目装进三棵树（需要 GEM5_HOME 等环境变量）"
-	@echo "make clean          - 删掉 $(BUILD)/"
+	@echo "make clean          - 删掉本项目在 $(BUILD)/ 下的产物（不动别人的东西）"
 	@echo ""
 	@echo "仿真器的构建与端到端测试见 docs/04-integration.md"
 
@@ -74,5 +74,11 @@ install-vortex:
 install-coralnpu:
 	./coralnpuint/install.sh
 
+# 逐个删自己的产物，不是 `rm -rf $(BUILD)`。$(BUILD) 是 .gitignore 里的目录，别人
+# （比如在项目里顺手跑一次 gem5 的 scons）完全可能往里放几个 G 的中间产物，一句
+# rm -rf 会把那些一起端掉，而 make clean 是所有人都会随手敲的命令。
+# 加了新产物就在这里加一行；rmdir 不带 -p、失败也不算错，目录非空就说明里面还有
+# 不属于我们的东西，那就该留着。
 clean:
-	rm -rf $(BUILD)
+	rm -f $(BUILD)/test_writer
+	-@rmdir $(BUILD) 2>/dev/null || true
