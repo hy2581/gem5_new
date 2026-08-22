@@ -13,7 +13,8 @@ CXX     ?= g++
 BUILD   := build
 
 .PHONY: all check check-addrmap addrmap test test-tools test-writer \
-        install install-gem5 install-vortex install-coralnpu clean help
+        test-storage-chain install install-gem5 install-vortex \
+        install-coralnpu clean help
 
 all: check
 
@@ -22,6 +23,7 @@ help:
 	@echo "make addrmap        - 从 addrmap.json 重新生成 C++/Python 侧的地址表"
 	@echo "make check-addrmap  - 只校验生成物是否过期，不写文件"
 	@echo "make test           - test-tools + test-writer"
+	@echo "make test-storage-chain - AXI -> UCIe -> MC -> DFI -> memory 端到端仿真"
 	@echo "make install        - 把本项目装进三棵树（需要 GEM5_HOME 等环境变量）"
 	@echo "make clean          - 删掉本项目在 $(BUILD)/ 下的产物（不动别人的东西）"
 	@echo ""
@@ -40,6 +42,9 @@ check-addrmap:
 
 # ---- 自测 ------------------------------------------------------------------
 test: test-tools test-writer
+
+test-storage-chain:
+	$(MAKE) -C storage_chain test
 
 # 不用 pytest：少一个依赖，在只有 gem5 自带 python 的机器上也能跑。脚本自己数
 # 检查项、自己定退出码。
@@ -81,4 +86,5 @@ install-coralnpu:
 # 不属于我们的东西，那就该留着。
 clean:
 	rm -f $(BUILD)/test_writer
+	$(MAKE) -C storage_chain clean
 	-@rmdir $(BUILD) 2>/dev/null || true

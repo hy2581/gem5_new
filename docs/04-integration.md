@@ -270,14 +270,14 @@ GEM5_HOME=$HOME/gem5 CORALNPU_HOME=$HOME/coralnpu gem5int/tests/run_gem5_npu.sh
 # Vortex 单设备（tap 验收，不需要 RISC-V 工具链）
 GEM5_HOME=$HOME/gem5 VORTEX_HOME=$HOME/vortex-gpu/vortex gem5int/tests/run_vortex.sh
 
-# 不需要任何仿真器的检查（addrmap 同步性 + 193 项自测）
+# 不需要任何仿真器的检查（addrmap 同步性 + 234 项自测）
 make check
 
 # CoralNPU 设备库的纯 C 冒烟测试（不经 gem5）
 CORALNPU_HOME=$HOME/coralnpu coralnpuint/tests/run_smoke.sh
 ```
 
-`make check` = `gen_addrmap.py --check` + `tools/tests/test_tools.py`（123 项）+
+`make check` = `gen_addrmap.py --check` + `tools/tests/test_tools.py`（164 项）+
 `libhettrace/tests/test_writer.cc`（70 项）。两套自测都不用 pytest / gtest，各自数检查项、
 各自定退出码 —— 少两个依赖，在只有 gem5 自带 python 的机器上也能跑。
 
