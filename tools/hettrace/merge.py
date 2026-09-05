@@ -13,7 +13,7 @@ from __future__ import annotations
 import heapq
 
 from . import addrmap
-from .reader import OP_WRITE, discover, read_records
+from .reader import CHAN_NAMES, OP_WRITE, discover, read_records
 
 
 def _key(rec):
@@ -33,22 +33,31 @@ def merge_dir(directory):
 
 
 def write_text(records, out_fh, header_comment=True):
-    """把归并后的流写成文本。列与单源文本格式一致，额外加源名列便于阅读。"""
+    """把归并后的流写成文本。列与单源文本格式一致，额外加源名与区域列便于阅读。
+
+    归并保留全部五个通道。这是唯一一处"全量"视图 —— 下游要做访存分析时自己
+    按 chan 投影（reader.is_data_chan），而不是让归并替它决定看得见什么。
+    """
     if header_comment:
         out_fh.write("# hettrace merged\n")
-        out_fh.write("# tick src_name op addr size ctx seq flags region\n")
+        out_fh.write(
+            "# tick src_name chan op addr size axi_id txn ctx seq flags region\n"
+        )
     n = 0
     for r in records:
         src = addrmap.SRC_NAME_BY_ID.get(r.src_id, "src%d" % r.src_id)
         region = addrmap.region_of(r.addr) or "-"
         out_fh.write(
-            "%d %s %s 0x%x %d %d %d 0x%02x %s\n"
+            "%d %s %s %s 0x%x %d %d %d %d %d 0x%02x %s\n"
             % (
                 r.tick,
                 src,
+                CHAN_NAMES.get(r.chan, "??"),
                 "W" if r.op == OP_WRITE else "R",
                 r.addr,
                 r.size,
+                r.axi_id,
+                r.txn,
                 r.ctx,
                 r.seq,
                 r.flags,

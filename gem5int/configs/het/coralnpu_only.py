@@ -7,8 +7,8 @@
 #
 # 为什么单独存在：coralnpuint/tests/run_smoke.sh 已经在纯 C 里把设备库验过一遍，
 # 但那条路径里"gem5"是假的 —— 时钟由测试程序推，内存后端是测试程序里的数组。
-# 本脚本换成真的：时钟是 gem5 事件队列，内存后端是 gem5 的 physProxy，时间戳是
-# 真的 curTick()。两者都过，才说明 SimObject 这一层没问题。
+# 本脚本换成真的：时钟是 gem5 事件队列，AXI 请求经 DmaPort 进入 gem5 timing
+# 内存，只有 response 返回才给 NPU R/B，时间戳也是真的 curTick()。
 #
 # 系统里没有 CPU。这是有意的：要验的是"gem5 能不能自己把 NPU 跑起来并落 trace"，
 # 掺进一个 host CPU 只会把失败原因变模糊。host 侧的配合在 het_system.py 里。
@@ -63,9 +63,9 @@ def main():
     system.clk_domain = SrcClockDomain(
         clock="1GHz", voltage_domain=VoltageDomain()
     )
-    # atomic：本配置里没有 CPU，内存模式只影响 timing 侧，选 atomic 最省事。
-    # NPU 的 AXI master 走的是 physProxy（functional），跟这个设置无关。
-    system.mem_mode = "atomic"
+    # NPU 的 AXI master 现在走 timing DmaPort；必须使用 timing 模式，才能让 DDR
+    # 控制器的排队/响应时间反压 NPU。
+    system.mem_mode = "timing"
     system.mem_ranges = [AddrRange(DRAM_BASE, size=DRAM_SIZE)]
 
     system.membus = IOXBar()
@@ -73,8 +73,8 @@ def main():
     system.mem_ctrl.dram = DDR3_1600_8x8(range=system.mem_ranges[0])
     system.mem_ctrl.port = system.membus.mem_side_ports
 
-    # 必须连。physProxy 就是挂在 system_port 上的，不连的话 NPU 的第一次 AXI
-    # master 读就会在 readBlob 里挂掉 —— 而且报的是"没有 port"这种离现场很远的错。
+    # system_port 留给 functional 初始化/调试访问；正常 AXI 数据流走 dma timing
+    # port（见下方连接）。
     system.system_port = system.membus.cpu_side_ports
 
     system.coralnpu = CoralNPU(
@@ -92,6 +92,7 @@ def main():
         trace_enable=not args.no_trace,
     )
     system.coralnpu.pio = system.membus.mem_side_ports
+    system.coralnpu.dma = system.membus.cpu_side_ports
 
     root = Root(full_system=False, system=system)
     m5.instantiate()

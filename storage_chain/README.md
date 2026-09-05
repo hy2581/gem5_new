@@ -1,49 +1,47 @@
-# AXI 边界 → UCIe → MC → DFI → memory 功能链
+# AXI4 → HETTrace 参考边界
 
-这是一个从 AXI 边界开始、用于接口联调的最小 SystemVerilog 后端功能链，不是实际
-CPU/NPU/GPU 全链路、UCIe/DFI 协议实现或性能模型。当前 testbench 用参考 XPU BFM 发起流量；
-它给真实 XPU-to-AXI 留出 AXI ready/valid 边界，把其余模块先做成可运行占位，从而尽早验证
-读写数据、burst、字节使能、背压、ID/源标识和端到端无丢包。
+这个目录保留一个很小的 RTL 接口回归：`xpu_axi_master` 发出的 AXI4 请求穿过完全透明的
+`storage_chain_top`，旁路 monitor 将已握手的 AW/W/B/AR/R 暴露为 HETTrace v2 字段。checker
+同时验证五个通道在背压时保持 `VALID` 和 payload。
 
-正确分层是：
+这里不再包含 UCIe、memory controller、DFI 或内存时序占位模型。那些固定延迟模块容易被误解
+成目标协议/性能实现；当前项目的存储时序路径是：
 
 ```text
-CPU/NPU/GPU AXI master
-        ↓
-axi_to_memreq（AXI slave/事务化）
-        ↓
-ucie_link_model（功能级双向延迟链路）
-        ↓
-mc_model（单 outstanding、固定调度延迟）
-        ↓
-dfi_memory_model（简化 DFI/PHY + 字节数组存储）
+XPU/gem5 → 统一 memory-side AXI4 HETTrace
+         → hettrace convert --preset memsim
+         → 外部 mem_sim/hbm_sim
 ```
 
 ## 运行
 
 ```bash
 make -C storage_chain test
-# 或在仓库根目录：make test-storage-chain
+# 或在仓库根目录
+make test-storage-chain
 ```
 
-成功结尾：
+成功输出：
 
 ```text
-CHAIN PASS: AXI beats=15, UCIe req/rsp=15/15, MC cmds=15, DFI writes/reads=8/7
+AXI TRACE PASS: 6 transactions, 15 AW/W/B/AR/R events, 3 sources
+PASS boundary is transparent; WSTRB, ID, USER, RESP and backpressure preserved
 ```
 
-默认使用 Icarus Verilog 12，构建产物在忽略的 `storage_chain/build/` 下。
+回归包含 host/Vortex/CoralNPU 三个 `AxUSER` 来源、全写和部分 `WSTRB`、读回、ID/RESP/LAST、
+地址/数据通道背压，以及每源 `seq` 和 `txn` 关联。
 
-## 文件
+## 文件与边界
 
 | 文件 | 作用 |
 |---|---|
-| `rtl/axi_to_memreq.sv` | XPU 接入边界；AXI4 对齐 INCR burst、单 outstanding |
-| `rtl/ucie_link_model.sv` | request/response 两条无损 ready/valid 延迟通道 |
-| `rtl/mc_model.sv` | 最小 MC：固定调度延迟，元数据原样返回 |
-| `rtl/dfi_memory_model.sv` | 简化 DFI 功能接口和 4 KiB byte array |
-| `rtl/storage_chain_top.sv` | 完整连接与各阶段计数器 |
-| `tb/tb_storage_chain.sv` | CPU/NPU/GPU 参考激励、scoreboard、背压与 WSTRB 测试 |
+| `rtl/xpu_axi_master.sv` | 单 outstanding 的参考 XPU command→AXI4 master |
+| `rtl/axi_subset_checker.sv` | 五通道 ready/valid payload 稳定性检查 |
+| `rtl/axi_hettrace_monitor.sv` | 被动输出 HETTrace v2 事件字段；不记录 WDATA/RDATA |
+| `rtl/storage_chain_top.sv` | 透明 AXI4 passthrough + checker + monitor |
+| `tb/tb_storage_chain.sv` | 功能 BFM 与字段/计数 scoreboard；BFM 延迟不代表存储性能 |
 
-实际 XPU 接入方法、接口契约、标准边界和逐步替换路线见
-[`docs/06-storage-chain-plan.md`](../docs/06-storage-chain-plan.md)。
+参考 monitor 当前只覆盖单 outstanding read、单 outstanding write，并要求同一周期最多一个通道
+握手；这是明确受限的集成样例，不是完整 AXI VIP。生产路径的 gem5 `HetAxiMonitor` 支持多个
+packet outstanding，并将 host/Vortex 的推导字段标为 `SYNTH`。HETTrace 没有 WDATA，因此功能
+正确性依然要靠真实数据通路/scoreboard，外部 hbm_sim 只给固定请求流的 open-loop 存储时序。

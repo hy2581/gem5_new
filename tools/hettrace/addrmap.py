@@ -12,6 +12,7 @@ LEVELS = {
     "post_llc": 0,
     "pre_cache": 1,
     "axi_master": 2,
+    "interconnect": 3,
 }
 LEVEL_NAMES = {v: k for k, v in LEVELS.items()}
 

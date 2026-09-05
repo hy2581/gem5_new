@@ -17,14 +17,13 @@
 //    the entire reason the CoralNPU wrapper needed a non-blocking halted()/
 //    wfi() accessor added to it.
 //
-// 2. Memory is genuinely shared, not just co-addressed. The library's AXI
-//    master callbacks are routed into system->physProxy (functional access,
-//    zero simulated time), so the NPU reads the bytes the host CPU actually
-//    wrote. Functional is a deliberate choice, not a shortcut: the AXI read
-//    callback must return 16 bytes within the same cycle, so there is nothing
-//    to return if we had to wait for a timing response. The cost is that NPU
-//    traffic imposes no contention on the memory system -- consistent with
-//    this project's scope (observe traffic, don't model coupled timing).
+// 2. Memory is shared in both data and timing. An AXI handshake starts a gem5
+//    DmaPort timing request through the host's xbar/memory. The device library
+//    withholds RVALID/BVALID until that request's completion event calls back,
+//    so memory latency and contention stall the real RTL and move later issue
+//    times. Every accepted operation gets a unique substream sequence; AXI ID
+//    is carried as the Request stream ID, and native byte enables preserve
+//    WSTRB without synthesizing a read-modify-write transaction.
 //
 // 3. Tracing is opt-in and never fatal. trace_enable=false, a library built
 //    before the trace ABI, or an unset HETTRACE_DIR all mean "no trace" and
@@ -33,17 +32,22 @@
 #ifndef __DEV_CORALNPU_CORALNPU_DEV_HH__
 #define __DEV_CORALNPU_CORALNPU_DEV_HH__
 
+#include <array>
 #include <cstdint>
+#include <deque>
+#include <map>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "dev/io_device.hh"
+#include "dev/dma_device.hh"
 #include "params/CoralNPU.hh"
 #include "sim/eventq.hh"
 
 namespace gem5
 {
 
-class CoralNPU : public BasicPioDevice
+class CoralNPU : public DmaDevice
 {
 public:
     using Params = CoralNPUParams;
@@ -54,8 +58,10 @@ public:
     // PioDevice interface — the control/status/mailbox register window.
     Tick read(PacketPtr pkt) override;
     Tick write(PacketPtr pkt) override;
+    AddrRangeList getAddrRanges() const override;
 
     // SimObject lifecycle
+    void init() override;
     void startup() override;
 
 private:
@@ -104,15 +110,22 @@ private:
     // the sidecar downstream truncation detection has nothing to compare to.
     void closeTrace();
 
-    // AXI master memory backend ---------------------------------------
-    // Static trampolines handed to the library; ctx is `this`. Both are
-    // synchronous functional accesses into gem5's physical memory.
-    static void memReadTrampoline(void *ctx, uint64_t addr,
-                                  uint8_t *dst, uint32_t size);
-    static void memWriteTrampoline(void *ctx, uint64_t addr,
-                                   const uint8_t *src, uint32_t size);
-    void memRead(uint64_t addr, uint8_t *dst, uint32_t size);
-    void memWrite(uint64_t addr, const uint8_t *src, uint32_t size);
+    // AXI master timing backend ---------------------------------------
+    // The library calls issue* only after an AXI handshake. DmaPort sends a
+    // timing request through the same gem5 xbar/memory used by the host and
+    // invokes the completion event later; only then is AXI B/R injected.
+    static void issueReadTrampoline(void *ctx, uint64_t addr, uint8_t axi_id,
+                                    uint32_t size);
+    static void issueWriteTrampoline(void *ctx, uint64_t addr, uint8_t axi_id,
+                                     const uint8_t *src, uint16_t strb,
+                                     uint32_t size);
+    void issueRead(uint64_t addr, uint8_t axi_id, uint32_t size);
+    void issueWrite(uint64_t addr, uint8_t axi_id, const uint8_t *src,
+                    uint16_t strb, uint32_t size);
+    void readMemoryComplete(uint64_t sequence);
+    void writeMemoryComplete(uint64_t sequence);
+    void retireReadyReads(uint8_t axi_id);
+    void retireReadyWrites(uint8_t axi_id);
 
     // Library binding ------------------------------------------------
     void *libHandle_;
@@ -130,6 +143,16 @@ private:
                                                         const uint8_t *,
                                                         uint32_t),
                                        void *ctx);
+        void        (*set_timing_backend)(
+                         void *h,
+                         void (*read_fn)(void *, uint64_t, uint8_t, uint32_t),
+                         void (*write_fn)(void *, uint64_t, uint8_t,
+                                          const uint8_t *, uint16_t, uint32_t),
+                         void *ctx);
+        void        (*complete_read)(void *h, uint8_t axi_id,
+                                     const uint8_t *src, uint32_t size,
+                                     uint8_t resp);
+        void        (*complete_write)(void *h, uint8_t axi_id, uint8_t resp);
         int         (*load_elf)(void *h, const char *path, uint32_t *out_entry);
         void        (*start)(void *h, uint32_t start_addr);
         bool        (*tick)(void *h);
@@ -160,7 +183,9 @@ private:
     const bool        shareMemory_;
     const bool        traceEnable_;
     const int64_t     traceAddrOffset_;
-    // PIO base/size/latency live in BasicPioDevice as pioAddr/pioSize/pioDelay.
+    const Addr        pioAddr;
+    const Addr        pioSize;
+    const Tick        pioDelay;
 
     // State ----------------------------------------------------------
     EventFunctionWrapper tickEvent_;
@@ -168,6 +193,46 @@ private:
     bool                 started_;
     bool                 traceActive_;
     uint64_t             cycles_;
+
+    static constexpr uint32_t AxiBeatBytes = 16;
+
+    struct ReadTxn
+    {
+        uint64_t sequence;
+        Addr addr;
+        uint8_t axiId;
+        uint32_t size;
+        Tick issueTick;
+        std::vector<uint8_t> data;
+        bool memoryDone = false;
+    };
+
+    struct WriteTxn
+    {
+        uint64_t sequence;
+        Addr addr;
+        uint8_t axiId;
+        uint32_t size;
+        uint16_t strb;
+        Tick issueTick;
+        std::vector<uint8_t> data;
+        std::vector<bool> byteEnable;
+        bool memoryDone = false;
+    };
+
+    uint64_t nextAxiSequence_ = 1;
+    std::map<uint64_t, std::unique_ptr<ReadTxn>> readTxns_;
+    std::map<uint64_t, std::unique_ptr<WriteTxn>> writeTxns_;
+    std::array<std::deque<uint64_t>, 256> readOrderById_;
+    std::array<std::deque<uint64_t>, 256> writeOrderById_;
+    uint64_t             maxReadOutstanding_ = 0;
+    uint64_t             maxWriteOutstanding_ = 0;
+    uint64_t             timingReads_ = 0;
+    uint64_t             timingWrites_ = 0;
+    Tick                 readLatencyTotal_ = 0;
+    Tick                 writeLatencyTotal_ = 0;
+    Tick                 readLatencyMax_ = 0;
+    Tick                 writeLatencyMax_ = 0;
 };
 
 } // namespace gem5

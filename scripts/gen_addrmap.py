@@ -22,7 +22,14 @@ PY_PATH = os.path.join(ROOT, "tools", "hettrace", "addrmap.py")
 
 BANNER = "本文件由 scripts/gen_addrmap.py 从 addrmap.json 生成，请勿手改。"
 
-LEVELS = {"post_llc": 0, "pre_cache": 1, "axi_master": 2}
+# tap 观测点。数值会进 trace 文件头，所以只能在末尾追加，不能重排。
+#
+# interconnect 是给 gem5 的 HetAxiMonitor 用的：它挂在互连边界上，一个点同时
+# 看见三个源的 AXI 事务。这与 post_llc/pre_cache/axi_master 那三个"在源自己
+# 内部某处"的观测点是不同性质的位置，混用会让"这条记录是在哪儿看到的"这个
+# 问题失去答案。addrmap.json 里每个源声明的 level 描述的仍是它自己的设备 tap；
+# monitor 写文件时显式传 kLevelInterconnect。
+LEVELS = {"post_llc": 0, "pre_cache": 1, "axi_master": 2, "interconnect": 3}
 
 
 def load():

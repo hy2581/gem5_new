@@ -3,6 +3,9 @@
 刻意不做的事：不算延迟、不算 IPC、不算加速比。抓到的 trace 是"无争抢延迟时"
 的访问模式（docs/03-limitations.md），任何依赖请求间时间差反馈的量都是错的。
 这里只出与时序反馈无关的量：带宽、footprint、局部性、区域分布、跨源交叠。
+
+一律走 read_data_records：这里所有的量都是"搬了多少字节到哪些地址"，
+AW/AR/B 不搬字节，算进来会让带宽和 footprint 同时虚高。
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 from collections import namedtuple
 
 from . import addrmap
-from .reader import OP_WRITE, discover, read_records
+from .reader import OP_WRITE, discover, read_data_records
 
 WindowStat = namedtuple("WindowStat", "start end per_src_bytes per_src_count")
 
@@ -34,7 +37,7 @@ def bandwidth_timeline(directory, window_ticks):
     for path, hdr in entries:
         name = addrmap.SRC_NAME_BY_ID.get(hdr.src_id, hdr.name)
         src_names.append(name)
-        for r in read_records(path):
+        for r in read_data_records(path):
             all_recs.append((r.tick, name, r.size))
 
     if not all_recs:
@@ -72,7 +75,7 @@ def footprint(directory, line_bytes=64):
     for path, hdr in entries:
         name = addrmap.SRC_NAME_BY_ID.get(hdr.src_id, hdr.name)
         s = set()
-        for r in read_records(path):
+        for r in read_data_records(path):
             lo = r.addr // line_bytes
             hi = (r.addr + max(r.size, 1) - 1) // line_bytes
             for ln in range(lo, hi + 1):
@@ -96,7 +99,7 @@ def rw_and_region_breakdown(directory):
         name = addrmap.SRC_NAME_BY_ID.get(hdr.src_id, hdr.name)
         reads = writes = rbytes = wbytes = 0
         regions = {}
-        for r in read_records(path):
+        for r in read_data_records(path):
             reg = addrmap.region_of(r.addr) or "<unmapped>"
             d = regions.setdefault(reg, [0, 0, 0, 0])
             if r.op == OP_WRITE:

@@ -59,7 +59,8 @@ class VortexTraceTap {
         if (proc == nullptr) return false;
         if (!writer_.Open(hettrace::kSrcVortex, "vortex",
                           hettrace::kLevelPostLlc,
-                          hettrace::kClockPeriodTicks_vortex)) {
+                          hettrace::kClockPeriodTicks_vortex,
+                          /*axi_data_bytes=*/VX_CFG_MEM_BLOCK_SIZE)) {
             return false;
         }
         tick_fn_     = tick_fn;
@@ -74,8 +75,9 @@ class VortexTraceTap {
     // CP 的 DMA。由 vortex_gpgpu.cpp 的 CommandProcessor::Hooks::dram_{read,write}
     // 调过来，**不是**从 pre_send hook 来的。
     //
-    // 为什么必须单独接一条：CP 直接读写 simx::RAM，既不过 Vortex 的 cache 层级也不
-    // 过 vortex::Memory，所以 pre_send hook 完全看不到它。而它恰好是设备内存流量里
+    // 为什么必须单独接一条：上游 CP 路径绕过 Vortex 的 cache 层级和
+    // vortex::Memory，所以 pre_send hook 完全看不到它；当前 timing bridge 也正是在
+    // 这个 hook 上提交 DMA 与门控后继 CP tick。而它恰好是设备内存流量里
     // 最大的一块 —— .vxbin 镜像上传、以及每次载荷在"暂存区 <-> 设备缓冲"之间的中转
     // 都走这里。漏掉它有两个后果，都不是"少一点数据"那么轻：
     //
@@ -92,18 +94,15 @@ class VortexTraceTap {
         const uint64_t tick = (tick_fn_ != nullptr) ? tick_fn_(tick_ctx_) : 0;
         // 一次 DMA 可以有几十 KB。按块粒度展开，理由与 EmitBurst 相同：记成一条
         // 巨大的记录会让局部性分析和 hettrace convert 的下游都失真 —— DRAM 是按块
-        // 搬的。首块不带 kFlagBurstBeat，其余带，与 AXI 侧的约定一致。
+        // 搬的。每块由 Emit() 分配独立 txn、且 axi_len=0，所以它们都是单拍
+        // 访问，不能借用 kFlagBurstBeat（该位只表示同一 txn 的非首拍）。
         const uint64_t blk = VX_CFG_MEM_BLOCK_SIZE;
         const uint64_t end = addr + bytes;
-        bool first = true;
         for (uint64_t p = addr & ~(blk - 1); p < end; p += blk) {
             writer_.Emit(tick, static_cast<uint64_t>(
                                    static_cast<int64_t>(p) + addr_offset_),
                          static_cast<uint32_t>(blk), op, kDmaCtx,
-                         static_cast<uint8_t>(
-                             hettrace::kFlagDma |
-                             (first ? 0 : hettrace::kFlagBurstBeat)));
-            first = false;
+                         hettrace::kFlagDma);
         }
     }
 

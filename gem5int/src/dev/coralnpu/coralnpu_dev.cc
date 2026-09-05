@@ -2,7 +2,9 @@
 
 #include "dev/coralnpu/coralnpu_dev.hh"
 
+#include <algorithm>
 #include <dlfcn.h>
+#include <limits>
 
 #include "base/logging.hh"
 #include "base/trace.hh"
@@ -45,7 +47,7 @@ T dlsym_optional(void *handle, const char *symbol)
 } // namespace
 
 CoralNPU::CoralNPU(const Params &p)
-  : BasicPioDevice(p, p.pio_size),
+  : DmaDevice(p),
     libHandle_(nullptr),
     deviceHandle_(nullptr),
     abi_{},
@@ -57,6 +59,9 @@ CoralNPU::CoralNPU(const Params &p)
     shareMemory_(p.share_memory),
     traceEnable_(p.trace_enable),
     traceAddrOffset_(p.trace_addr_offset),
+    pioAddr(p.pio_addr),
+    pioSize(p.pio_size),
+    pioDelay(p.pio_latency),
     tickEvent_([this]{ this->tick(); }, name() + ".tickEvent"),
     entryPc_(0),
     started_(false),
@@ -86,6 +91,21 @@ CoralNPU::CoralNPU(const Params &p)
                               void(*)(void*, uint64_t, const uint8_t*, uint32_t),
                               void*)>
                             (libHandle_, "coralnpu_gem5_set_mem_backend", libraryPath_.c_str());
+    abi_.set_timing_backend = dlsym_or_fatal<void(*)(
+                              void*,
+                              void(*)(void*, uint64_t, uint8_t, uint32_t),
+                              void(*)(void*, uint64_t, uint8_t,
+                                     const uint8_t*, uint16_t, uint32_t),
+                              void*)>
+                            (libHandle_, "coralnpu_gem5_set_timing_backend",
+                             libraryPath_.c_str());
+    abi_.complete_read    = dlsym_or_fatal<void(*)(
+                              void*, uint8_t, const uint8_t*, uint32_t, uint8_t)>
+                            (libHandle_, "coralnpu_gem5_complete_read",
+                             libraryPath_.c_str());
+    abi_.complete_write   = dlsym_or_fatal<void(*)(void*, uint8_t, uint8_t)>
+                            (libHandle_, "coralnpu_gem5_complete_write",
+                             libraryPath_.c_str());
     abi_.load_elf        = dlsym_or_fatal<int(*)(void*, const char*, uint32_t*)>
                             (libHandle_, "coralnpu_gem5_load_elf",        libraryPath_.c_str());
     abi_.start           = dlsym_or_fatal<void(*)(void*, uint32_t)>
@@ -136,36 +156,175 @@ CoralNPU::~CoralNPU()
     }
 }
 
-// ---- AXI master memory backend ---------------------------------------------
+// ---- AXI master timing backend ---------------------------------------------
 
 void
-CoralNPU::memReadTrampoline(void *ctx, uint64_t addr, uint8_t *dst,
-                            uint32_t size)
-{
-    static_cast<CoralNPU *>(ctx)->memRead(addr, dst, size);
-}
-
-void
-CoralNPU::memWriteTrampoline(void *ctx, uint64_t addr, const uint8_t *src,
+CoralNPU::issueReadTrampoline(void *ctx, uint64_t addr, uint8_t axi_id,
                              uint32_t size)
 {
-    static_cast<CoralNPU *>(ctx)->memWrite(addr, src, size);
+    static_cast<CoralNPU *>(ctx)->issueRead(addr, axi_id, size);
 }
 
 void
-CoralNPU::memRead(uint64_t addr, uint8_t *dst, uint32_t size)
+CoralNPU::issueWriteTrampoline(void *ctx, uint64_t addr, uint8_t axi_id,
+                              const uint8_t *src, uint16_t strb,
+                              uint32_t size)
 {
-    // Functional, not timing: the AXI read callback must produce data in the
-    // same cycle it is called (see coralnpu_dev.hh). readBlob fatals if the
-    // address is unmapped, which is the behaviour we want — silently returning
-    // zeros would show up much later as a mysteriously wrong kernel result.
-    sys->physProxy.readBlob(addr, dst, size);
+    static_cast<CoralNPU *>(ctx)->issueWrite(addr, axi_id, src, strb, size);
 }
 
 void
-CoralNPU::memWrite(uint64_t addr, const uint8_t *src, uint32_t size)
+CoralNPU::issueRead(uint64_t addr, uint8_t axi_id, uint32_t size)
 {
-    sys->physProxy.writeBlob(addr, src, size);
+    panic_if(size != AxiBeatBytes,
+             "CoralNPU: timing read size %u, expected %u", size, AxiBeatBytes);
+    panic_if(nextAxiSequence_ > std::numeric_limits<uint32_t>::max(),
+             "CoralNPU: AXI transaction sequence exhausted");
+
+    const uint64_t sequence = nextAxiSequence_++;
+    auto txn = std::make_unique<ReadTxn>();
+    txn->sequence = sequence;
+    txn->addr = addr;
+    txn->axiId = axi_id;
+    txn->size = size;
+    txn->issueTick = curTick();
+    txn->data.resize(size);
+    auto *data = txn->data.data();
+    readTxns_.emplace(sequence, std::move(txn));
+    readOrderById_[axi_id].push_back(sequence);
+    maxReadOutstanding_ = std::max<uint64_t>(maxReadOutstanding_,
+                                             readTxns_.size());
+    ++timingReads_;
+
+    auto *done = new EventFunctionWrapper(
+        [this, sequence] { readMemoryComplete(sequence); },
+        name() + ".axiReadDone", true);
+    dmaRead(addr, size, done, data, axi_id,
+            static_cast<uint32_t>(sequence));
+}
+
+void
+CoralNPU::issueWrite(uint64_t addr, uint8_t axi_id, const uint8_t *src,
+                     uint16_t strb, uint32_t size)
+{
+    panic_if(size != AxiBeatBytes,
+             "CoralNPU: timing write size %u, expected %u", size, AxiBeatBytes);
+    panic_if(src == nullptr, "CoralNPU: timing write has no data");
+    panic_if(nextAxiSequence_ > std::numeric_limits<uint32_t>::max(),
+             "CoralNPU: AXI transaction sequence exhausted");
+
+    const uint64_t sequence = nextAxiSequence_++;
+    auto txn = std::make_unique<WriteTxn>();
+    txn->sequence = sequence;
+    txn->addr = addr;
+    txn->axiId = axi_id;
+    txn->size = size;
+    txn->strb = strb;
+    txn->issueTick = curTick();
+    txn->data.assign(src, src + size);
+    txn->byteEnable.resize(size);
+    for (uint32_t byte = 0; byte < size; ++byte)
+        txn->byteEnable[byte] = (strb & (1u << byte)) != 0;
+    auto *data = txn->data.data();
+    const auto &byte_enable = txn->byteEnable;
+    writeTxns_.emplace(sequence, std::move(txn));
+    writeOrderById_[axi_id].push_back(sequence);
+    maxWriteOutstanding_ = std::max<uint64_t>(maxWriteOutstanding_,
+                                              writeTxns_.size());
+    ++timingWrites_;
+
+    auto *done = new EventFunctionWrapper(
+        [this, sequence] { writeMemoryComplete(sequence); },
+        name() + ".axiWriteDone", true);
+    dmaWrite(addr, size, done, data, byte_enable, axi_id,
+             static_cast<uint32_t>(sequence));
+}
+
+void
+CoralNPU::readMemoryComplete(uint64_t sequence)
+{
+    auto it = readTxns_.find(sequence);
+    panic_if(it == readTxns_.end(),
+             "CoralNPU: unknown AXI read sequence %llu",
+             static_cast<unsigned long long>(sequence));
+    panic_if(it->second->memoryDone,
+             "CoralNPU: duplicate AXI read completion %llu",
+             static_cast<unsigned long long>(sequence));
+    it->second->memoryDone = true;
+    retireReadyReads(it->second->axiId);
+}
+
+void
+CoralNPU::writeMemoryComplete(uint64_t sequence)
+{
+    auto it = writeTxns_.find(sequence);
+    panic_if(it == writeTxns_.end(),
+             "CoralNPU: unknown AXI write sequence %llu",
+             static_cast<unsigned long long>(sequence));
+    panic_if(it->second->memoryDone,
+             "CoralNPU: duplicate AXI write completion %llu",
+             static_cast<unsigned long long>(sequence));
+    it->second->memoryDone = true;
+    retireReadyWrites(it->second->axiId);
+}
+
+void
+CoralNPU::retireReadyReads(uint8_t axi_id)
+{
+    auto &order = readOrderById_[axi_id];
+    while (!order.empty()) {
+        const uint64_t sequence = order.front();
+        auto it = readTxns_.find(sequence);
+        panic_if(it == readTxns_.end(),
+                 "CoralNPU: missing AXI read sequence %llu in ID queue",
+                 static_cast<unsigned long long>(sequence));
+        ReadTxn &txn = *it->second;
+        if (!txn.memoryDone)
+            break;
+
+        const Tick latency = curTick() - txn.issueTick;
+        readLatencyTotal_ += latency;
+        readLatencyMax_ = std::max(readLatencyMax_, latency);
+        abi_.complete_read(deviceHandle_, txn.axiId, txn.data.data(),
+                           txn.size, 0);
+        DPRINTF(CoralNPU,
+                "AXI read retire seq=%llu id=%u addr=%#llx latency=%llu "
+                "ticks\n",
+                static_cast<unsigned long long>(sequence), txn.axiId,
+                static_cast<unsigned long long>(txn.addr),
+                static_cast<unsigned long long>(latency));
+        order.pop_front();
+        readTxns_.erase(it);
+    }
+}
+
+void
+CoralNPU::retireReadyWrites(uint8_t axi_id)
+{
+    auto &order = writeOrderById_[axi_id];
+    while (!order.empty()) {
+        const uint64_t sequence = order.front();
+        auto it = writeTxns_.find(sequence);
+        panic_if(it == writeTxns_.end(),
+                 "CoralNPU: missing AXI write sequence %llu in ID queue",
+                 static_cast<unsigned long long>(sequence));
+        WriteTxn &txn = *it->second;
+        if (!txn.memoryDone)
+            break;
+
+        const Tick latency = curTick() - txn.issueTick;
+        writeLatencyTotal_ += latency;
+        writeLatencyMax_ = std::max(writeLatencyMax_, latency);
+        abi_.complete_write(deviceHandle_, txn.axiId, 0);
+        DPRINTF(CoralNPU,
+                "AXI write retire seq=%llu id=%u addr=%#llx strb=%#x "
+                "latency=%llu ticks\n",
+                static_cast<unsigned long long>(sequence), txn.axiId,
+                static_cast<unsigned long long>(txn.addr), txn.strb,
+                static_cast<unsigned long long>(latency));
+        order.pop_front();
+        writeTxns_.erase(it);
+    }
 }
 
 // ---- Tracing ---------------------------------------------------------------
@@ -237,19 +396,15 @@ CoralNPU::closeTrace()
 void
 CoralNPU::startup()
 {
-    BasicPioDevice::startup();
+    DmaDevice::startup();
 
     if (shareMemory_) {
-        // Route the AXI master through gem5's physical memory so the NPU sees
-        // the bytes the host CPU actually wrote. Without this the library uses
-        // a private array and "shared buffer" is only shared in address, not
-        // in data.
-        abi_.set_mem_backend(deviceHandle_,
-                             &CoralNPU::memReadTrampoline,
-                             &CoralNPU::memWriteTrampoline,
-                             this);
-        inform("CoralNPU: AXI master routed to gem5 physical memory "
-               "(functional access)");
+        abi_.set_timing_backend(deviceHandle_,
+                                &CoralNPU::issueReadTrampoline,
+                                &CoralNPU::issueWriteTrampoline,
+                                this);
+        inform("CoralNPU: AXI master routed through gem5 DMA timing port "
+               "(B/R response feedback enabled)");
     } else {
         inform("CoralNPU: AXI master backed by the library's private DDR "
                "array — the shared buffer is NOT data-coherent with the host");
@@ -277,6 +432,18 @@ CoralNPU::startup()
     } else {
         inform("CoralNPU: waiting for the host to write REG_CTRL bit0");
     }
+}
+
+void
+CoralNPU::init()
+{
+    DmaDevice::init();
+}
+
+AddrRangeList
+CoralNPU::getAddrRanges() const
+{
+    return {RangeSize(pioAddr, pioSize)};
 }
 
 void
@@ -313,6 +480,21 @@ CoralNPU::tick()
            static_cast<unsigned long long>(cycles_),
            static_cast<int>(abi_.halted(deviceHandle_)),
            static_cast<int>(abi_.wfi(deviceHandle_)));
+    if (timingReads_ != 0 || timingWrites_ != 0) {
+        const auto readAvg = timingReads_ ? readLatencyTotal_ / timingReads_ : 0;
+        const auto writeAvg = timingWrites_ ? writeLatencyTotal_ / timingWrites_ : 0;
+        inform("CoralNPU: AXI timing summary reads=%llu avg=%llu max=%llu "
+               "writes=%llu avg=%llu max=%llu ticks max_outstanding[R/W]="
+               "%llu/%llu",
+               static_cast<unsigned long long>(timingReads_),
+               static_cast<unsigned long long>(readAvg),
+               static_cast<unsigned long long>(readLatencyMax_),
+               static_cast<unsigned long long>(timingWrites_),
+               static_cast<unsigned long long>(writeAvg),
+               static_cast<unsigned long long>(writeLatencyMax_),
+               static_cast<unsigned long long>(maxReadOutstanding_),
+               static_cast<unsigned long long>(maxWriteOutstanding_));
+    }
 
     if (exitOnComplete_) {
         // Standalone smoke-test path: nothing else is driving the simulation,

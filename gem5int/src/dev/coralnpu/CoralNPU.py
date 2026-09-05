@@ -3,11 +3,11 @@
 # Installed into $GEM5_HOME/src/dev/coralnpu/ by gem5int/install.sh; the
 # source of truth is this project's tree.
 
-from m5.objects.Device import BasicPioDevice
+from m5.objects.Device import DmaDevice
 from m5.params import *
 
 
-class CoralNPU(BasicPioDevice):
+class CoralNPU(DmaDevice):
     type = "CoralNPU"
     cxx_header = "dev/coralnpu/coralnpu_dev.hh"
     cxx_class = "gem5::CoralNPU"
@@ -40,12 +40,9 @@ class CoralNPU(BasicPioDevice):
         False, "exitSimLoop() when the kernel finishes"
     )
 
-    # Route the library's AXI master through gem5 physical memory instead of
-    # its private DDR array. Without this the NPU and the host agree on
-    # *addresses* but not on *bytes*, and a cooperative workload silently
-    # computes garbage. The access is functional (zero simulated time) —
-    # required, because an AXI read callback has to return data in the same
-    # cycle it is called. See the design notes in coralnpu_dev.hh.
+    # Route the library's AXI master through the gem5 DMA timing port instead
+    # of its private DDR array. B/R responses are injected only when the
+    # timing request returns, so latency and contention feed back to the RTL.
     share_memory = Param.Bool(
         True, "Back the AXI master with gem5 physical memory"
     )
@@ -53,18 +50,11 @@ class CoralNPU(BasicPioDevice):
     # Control/status/mailbox window. 0x20 of registers is the whole
     # interface; once running, host and NPU talk through the shared buffer.
     #
-    # pio_addr is *inherited* from BasicPioDevice, so this line is a plain
-    # default-value override, NOT `pio_addr = Param.Addr(...)`. Redeclaring it
-    # as a Param compiles and looks right, but it puts a second `Addr pio_addr`
-    # into CoralNPUParams that shadows BasicPioDeviceParams::pio_addr — and
-    # BasicPioDevice's ctor reads the base one, which nothing ever fills. The
-    # device then registers [0x0, +pio_size) on the bus while config.ini shows
-    # the address you asked for, and the first host PIO access dies in
-    # xbar.cc with "Unable to find destination". pio_size has no such twin:
-    # BasicPioDevice has no size param (it takes the size as a ctor argument),
-    # so declaring it here is correct.
-    pio_addr = 0x30000000
+    # DmaDevice does not provide a PIO range, so this object declares all
+    # three fields and getAddrRanges() publishes the window.
+    pio_addr = Param.Addr(0x30000000, "PIO base address")
     pio_size = Param.Addr(0x0020, "PIO region size (bytes)")
+    pio_latency = Param.Latency("1ns", "PIO access latency")
 
     # ---- Memory-access tracing (hettrace) ------------------------------
     # Read-only tap on the AXI master port, i.e. exactly the traffic that

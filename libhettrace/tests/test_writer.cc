@@ -57,6 +57,13 @@ static void TestDisabledWhenNoEnv() {
     CHECK(!w.is_open(), "未设置时应保持关闭");
     // 关闭状态下 Emit 必须是安全的 no-op
     w.Emit(0, kSharedBufferBase, 64, kRead, 0);
+    AxiTxn txn;
+    txn.addr = kSharedBufferBase;
+    txn.bytes = 16;
+    txn.axi_size = 4;
+    CHECK(!w.BeginRead(0, txn), "关闭状态下 BeginRead 应是安静的 no-op");
+    CHECK(!w.CompleteRead(1, txn, kRespOkay),
+          "关闭状态下 CompleteRead 应是安静的 no-op");
     CHECK(w.stats().emitted == 0, "关闭状态不应产生记录");
 }
 
@@ -68,7 +75,7 @@ static void TestHeaderAndRoundTrip() {
     {
         TraceWriter w;
         CHECK(w.Open(kSrcVortex, "vortex", kLevelPostLlc,
-                     kClockPeriodTicks_vortex),
+                     kClockPeriodTicks_vortex, /*axi_data_bytes=*/64),
               "Open 应成功");
         w.Emit(1000, kSharedBufferBase, 64, kRead, 7);
         w.Emit(2000, kSharedBufferBase + 64, 64, kWrite, 7);
@@ -80,13 +87,15 @@ static void TestHeaderAndRoundTrip() {
 
     CHECK(std::memcmp(h.magic, kMagic, 8) == 0, "magic 应匹配");
     CHECK(h.version == kFormatVersion, "version 应匹配");
-    CHECK(h.record_size == sizeof(Record), "record_size 应为 32");
+    CHECK(h.record_size == sizeof(Record), "record_size 应为 56");
     CHECK(h.ticks_per_second == kTicksPerSecond, "ticks_per_second 应匹配");
     CHECK(h.clock_period_ticks == kClockPeriodTicks_vortex,
           "clock_period_ticks 应匹配");
     CHECK(h.src_id == kSrcVortex, "src_id 应匹配");
     CHECK(h.level == kLevelPostLlc, "level 应匹配");
     CHECK((h.flags & kHdrFilteredDram) != 0, "默认应为 dram 过滤");
+    CHECK(h.axi_data_bytes == 64, "axi_data_bytes 应记录调用方声明的 64B");
+    CHECK(h.axi_addr_bits == kMapAddrBits, "axi_addr_bits 应为地址图宽度");
     CHECK(std::strcmp(h.name, "vortex") == 0, "name 应匹配");
 
     CHECK(recs.size() == 3, "应有 3 条记录");
@@ -102,6 +111,192 @@ static void TestHeaderAndRoundTrip() {
     }
 }
 
+// Emit() 是"每次访问一条记录"这一旧语义在 v2 格式里的投影。它必须只写数据
+// 通道 —— 设备 tap 观测不到独立的地址通道与响应通道，替它们造 AW/B 记录就是
+// 把推测写成观测。同时条数必须与旧格式逐条对齐，否则任何跨版本的回归对比
+// 都失去基准。
+static void TestDataChannelProjection() {
+    setenv("HETTRACE_DIR", g_dir.c_str(), 1);
+    setenv("HETTRACE_FORMAT", "bin", 1);
+    unsetenv("HETTRACE_FILTER");
+
+    {
+        TraceWriter w;
+        w.Open(kSrcHost, "host_proj", kLevelPostLlc, kClockPeriodTicks_host,
+               /*axi_data_bytes=*/64);
+        w.Emit(10, kSharedBufferBase, 64, kRead, 5);
+        w.Emit(20, kSharedBufferBase + 64, 8, kWrite, 5);
+    }
+
+    std::vector<Record> recs = ReadBin(g_dir + "/host_proj.hettrace", nullptr);
+    CHECK(recs.size() == 2, "Emit 每次应恰好一条记录");
+    if (recs.size() != 2) return;
+
+    for (const Record& r : recs) {
+        CHECK(IsDataChan(r.chan), "Emit 只应写数据通道");
+        CHECK((r.flags & kFlagLast) != 0, "单拍访问应带 LAST");
+        CHECK(r.axi_len == 0, "单拍访问 AxLEN 应为 0");
+        CHECK(r.burst == kBurstIncr, "默认应为 INCR");
+        CHECK(r.resp == kRespOkay, "默认响应应为 OKAY");
+    }
+    CHECK(recs[0].chan == kChanR && recs[0].op == kRead, "读应落在 R 通道");
+    CHECK(recs[0].strb == 0, "读通道 STRB 恒为 0");
+    CHECK(recs[0].axi_size == 6, "64 字节 => AxSIZE=6");
+    CHECK(recs[1].chan == kChanW && recs[1].op == kWrite, "写应落在 W 通道");
+    CHECK(recs[1].strb == 0xffull, "8 字节写应使能 8 条 lane");
+    CHECK(recs[1].axi_size == 3, "8 字节 => AxSIZE=3");
+    CHECK(recs[0].txn != recs[1].txn, "两次独立访问应是两笔事务");
+}
+
+// 全通道级：monitor 用。读事务的 R 必须在响应时刻写出，否则 trace 里读延迟
+// 会整体消失 —— 这正是本项目要喂给 DRAM 模拟器的那个量。
+static void TestFullChannelTransactions() {
+    setenv("HETTRACE_DIR", g_dir.c_str(), 1);
+    setenv("HETTRACE_FORMAT", "bin", 1);
+    unsetenv("HETTRACE_FILTER");
+
+    Stats st;
+    {
+        TraceWriter w;
+        w.Open(kSrcHost, "mon", kLevelInterconnect, kClockPeriodTicks_host,
+               /*axi_data_bytes=*/16, kMapAddrBits, /*synth=*/true);
+
+        AxiTxn wt;
+        wt.addr     = kSharedBufferBase;
+        wt.bytes    = 64;
+        wt.ctx      = 3;
+        wt.txn      = w.NextTxn();
+        wt.axi_id   = 9;
+        wt.axi_size = 4;  // 16 B/拍 => 4 拍
+        CHECK(wt.axi_len() == 3, "64 字节 / 16 字节每拍 => AxLEN=3");
+        const uint64_t strb[4] = {0xffffull, 0xffffull, 0xffffull, 0x00ffull};
+        w.BeginWrite(1000, wt, strb);
+        w.CompleteWrite(1500, wt, kRespOkay);
+
+        AxiTxn rt;
+        rt.addr     = kSharedBufferBase + 0x100;
+        rt.bytes    = 32;
+        rt.ctx      = 3;
+        rt.txn      = w.NextTxn();
+        rt.axi_id   = 10;
+        rt.axi_size = 4;  // 2 拍
+        w.BeginRead(2000, rt);
+        w.CompleteRead(2700, rt, kRespSlvErr);
+
+        w.Close();
+        st = w.stats();
+    }
+
+    // 写: AW + 4×W + B = 6; 读: AR + 2×R = 3
+    CHECK(st.emitted == 9, "两笔事务应写出 9 条记录");
+    CHECK(st.transactions == 2, "AW+AR 应计为 2 笔事务");
+    CHECK(st.data_records == 6, "数据通道应有 6 条（4 拍写 + 2 拍读）");
+    CHECK(st.bytes == 96, "数据字节应为 4×16 + 2×16");
+
+    std::vector<Record> recs = ReadBin(g_dir + "/mon.hettrace", nullptr);
+    CHECK(recs.size() == 9, "应写出 9 条");
+    if (recs.size() != 9) return;
+
+    CHECK(recs[0].chan == kChanAw, "第 0 条应为 AW");
+    CHECK(recs[0].size == 64, "AW 记整笔字节数");
+    CHECK(recs[0].axi_id == 9, "AW 应带 AXI ID");
+    CHECK(recs[0].strb == 0, "地址通道 STRB 恒为 0");
+    for (int i = 1; i <= 4; ++i) {
+        CHECK(recs[i].chan == kChanW, "第 1..4 条应为 W");
+        CHECK(recs[i].addr == kSharedBufferBase + (i - 1) * 16,
+              "W 地址应按拍递增");
+        CHECK(recs[i].txn == recs[0].txn, "同一事务的 txn 应一致");
+    }
+    CHECK(recs[4].strb == 0x00ffull, "末拍应保留调用方给的部分 STRB");
+    CHECK((recs[4].flags & kFlagLast) != 0, "末拍应带 WLAST");
+    CHECK((recs[3].flags & kFlagLast) == 0, "非末拍不应带 WLAST");
+    CHECK(recs[5].chan == kChanB, "第 5 条应为 B");
+    CHECK(recs[5].tick == 1500, "B 应记在响应时刻");
+    CHECK(recs[5].size == 0, "B 通道不搬字节");
+
+    CHECK(recs[6].chan == kChanAr, "第 6 条应为 AR");
+    CHECK(recs[6].tick == 2000, "AR 应记在请求时刻");
+    CHECK(recs[7].chan == kChanR && recs[7].tick == 2700,
+          "R 必须记在响应时刻，否则读延迟消失");
+    CHECK(recs[8].resp == kRespSlvErr, "错误响应应逐拍带到 R 上");
+    CHECK(recs[6].txn != recs[0].txn, "读写应是两笔不同事务");
+
+    for (const Record& r : recs) {
+        CHECK((r.flags & kFlagSynth) != 0, "synth=true 的源每条都应带 Synth");
+    }
+}
+
+static void TestFullChannelBurstKindsAndRejects() {
+    setenv("HETTRACE_DIR", g_dir.c_str(), 1);
+    setenv("HETTRACE_FORMAT", "bin", 1);
+    unsetenv("HETTRACE_FILTER");
+
+    TraceWriter w;
+    CHECK(w.Open(kSrcHost, "burst_kinds", kLevelInterconnect,
+                 kClockPeriodTicks_host, /*axi_data_bytes=*/16),
+          "burst 类型测试应能打开 writer");
+
+    AxiTxn fixed;
+    fixed.addr = kSharedBufferBase;
+    fixed.bytes = 32;
+    fixed.txn = w.NextTxn();
+    fixed.axi_size = 4;
+    fixed.burst = kBurstFixed;
+    CHECK(w.BeginRead(100, fixed), "合法 FIXED 应被接受");
+    CHECK(w.CompleteRead(200, fixed, kRespOkay), "合法 FIXED 应能完成");
+
+    AxiTxn wrap;
+    wrap.addr = kSharedBufferBase + 48;
+    wrap.bytes = 64;
+    wrap.txn = w.NextTxn();
+    wrap.axi_size = 4;
+    wrap.burst = kBurstWrap;
+    CHECK(w.BeginRead(300, wrap), "合法 WRAP 应被接受");
+    CHECK(w.CompleteRead(400, wrap, kRespOkay), "合法 WRAP 应能完成");
+
+    AxiTxn narrow;
+    narrow.addr = kSharedBufferBase + 8;
+    narrow.bytes = 4;
+    narrow.txn = w.NextTxn();
+    narrow.axi_size = 2;
+    narrow.burst = kBurstIncr;
+    CHECK(w.BeginWrite(450, narrow), "合法窄写应被接受");
+    CHECK(w.CompleteWrite(460, narrow, kRespOkay), "合法窄写应能完成");
+
+    AxiTxn partial = fixed;
+    partial.addr = kSharedBufferBase + 0x100;
+    partial.bytes = 20;
+    partial.txn = w.NextTxn();
+    CHECK(!w.BeginRead(500, partial), "非整拍事务必须被 writer 拒绝");
+
+    AxiTxn unaligned = fixed;
+    unaligned.addr = kSharedBufferBase + 3;
+    unaligned.txn = w.NextTxn();
+    CHECK(!w.BeginRead(600, unaligned), "unaligned 事务必须被 writer 拒绝");
+    w.Close();
+
+    std::vector<Record> recs = ReadBin(g_dir + "/burst_kinds.hettrace", nullptr);
+    // FIXED: AR+2R；WRAP: AR+4R；窄写: AW+W+B。被拒事务不能留下半条记录。
+    CHECK(recs.size() == 11, "三笔合法事务应产生 11 条记录");
+    if (recs.size() != 11) return;
+    CHECK(recs[1].addr == fixed.addr && recs[2].addr == fixed.addr,
+          "FIXED 的每个 R 拍地址必须保持不变");
+    const uint64_t wrap_expected[4] = {
+        kSharedBufferBase + 48,
+        kSharedBufferBase,
+        kSharedBufferBase + 16,
+        kSharedBufferBase + 32,
+    };
+    for (int i = 0; i < 4; ++i) {
+        CHECK(recs[4 + i].addr == wrap_expected[i],
+              "WRAP 的 R 拍地址必须在 wrap boundary 内回绕");
+    }
+    CHECK(recs[9].chan == kChanW && recs[9].addr == narrow.addr,
+          "窄写的数据拍位置应正确");
+    CHECK(recs[9].strb == 0x0f00,
+          "4B 窄写位于 16B bus lane 8..11 时默认 WSTRB 应为 0x0f00");
+}
+
 static void TestDramFilter() {
     setenv("HETTRACE_DIR", g_dir.c_str(), 1);
     setenv("HETTRACE_FORMAT", "bin", 1);
@@ -115,11 +310,13 @@ static void TestDramFilter() {
     w.Emit(30, kVortexCpBase, 4, kWrite, 0);       // CP 寄存器 -> 过滤
     w.Emit(40, kNpuMailboxBase, 16, kWrite, 0);    // mailbox 在 DRAM 窗口外 -> 过滤
     w.Emit(50, kNpuWorkBase, 16, kWrite, 0);       // DRAM 窗口内 -> 保留
+    w.Emit(60, 0xdeadbeef, 4, kRead, 0);           // 未映射且被过滤
     w.Close();
 
     CHECK(w.stats().emitted == 2, "dram 过滤后应剩 2 条");
-    CHECK(w.stats().filtered == 3, "应过滤掉 3 条");
-    CHECK(w.stats().unmapped == 0, "全部地址均应已映射");
+    CHECK(w.stats().filtered == 4, "应过滤掉 4 条");
+    CHECK(w.stats().unmapped == 1,
+          "未映射地址即使被过滤也应留在 meta 统计中");
 }
 
 static void TestFilterAll() {
@@ -174,6 +371,9 @@ static void TestBurstExpansion() {
 
     CHECK(w.stats().emitted == 4, "len=3 应展开为 4 拍");
     CHECK(w.stats().bytes == 64, "4 拍 × 16 字节 = 64");
+    CHECK(w.stats().data_records == 4, "burst 展开后全是数据通道记录");
+    CHECK(w.stats().transactions == 0,
+          "EmitBurst 不写地址通道，事务数应为 0");
 
     std::vector<Record> recs = ReadBin(g_dir + "/npu_burst.hettrace", nullptr);
     CHECK(recs.size() == 4, "应写出 4 条");
@@ -182,9 +382,14 @@ static void TestBurstExpansion() {
             CHECK(recs[i].addr == kSharedBufferBase + i * 16,
                   "burst 地址应按拍递增");
             CHECK(recs[i].size == 16, "每拍 16 字节");
+            CHECK(recs[i].chan == kChanR, "读 burst 应全落在 R 通道");
+            CHECK(recs[i].axi_len == 3, "每拍都应带整笔的 AxLEN");
+            CHECK(recs[i].txn == recs[0].txn, "同一 burst 的 txn 应一致");
         }
         CHECK((recs[0].flags & kFlagBurstBeat) == 0, "首拍不应带 BurstBeat");
         CHECK((recs[1].flags & kFlagBurstBeat) != 0, "非首拍应带 BurstBeat");
+        CHECK((recs[3].flags & kFlagLast) != 0, "末拍应带 RLAST");
+        CHECK((recs[2].flags & kFlagLast) == 0, "非末拍不应带 RLAST");
     }
 }
 
@@ -193,7 +398,8 @@ static void TestTextFormat() {
     setenv("HETTRACE_FORMAT", "text", 1);
     {
         TraceWriter w;
-        w.Open(kSrcHost, "host_txt", kLevelPostLlc, kClockPeriodTicks_host);
+        w.Open(kSrcHost, "host_txt", kLevelPostLlc, kClockPeriodTicks_host,
+               /*axi_data_bytes=*/64);
         w.Emit(4242, kSharedBufferBase + 0x100, 64, kWrite, 3);
     }
     setenv("HETTRACE_FORMAT", "bin", 1);
@@ -212,9 +418,11 @@ static void TestTextFormat() {
         body = line;
     }
     std::fclose(f);
-    CHECK(ncomment == 5, "文本头应为 5 行注释");
+    CHECK(ncomment == 6, "文本头应为 6 行注释");
     CHECK(body.find("4242") != std::string::npos, "应含 tick");
-    CHECK(body.find(" W ") != std::string::npos, "写应记为 W");
+    CHECK(body.find(" W W ") != std::string::npos, "写应记为 chan=W op=W");
+    CHECK(body.find("INCR") != std::string::npos, "应含 burst 类型");
+    CHECK(body.find("OKAY") != std::string::npos, "应含响应码");
     CHECK(body.find("0x90000100") != std::string::npos, "应含十六进制地址");
 }
 
@@ -224,7 +432,7 @@ static void TestMetaSidecar() {
     {
         TraceWriter w;
         w.Open(kSrcVortex, "vortex_meta", kLevelPostLlc,
-               kClockPeriodTicks_vortex);
+               kClockPeriodTicks_vortex, /*axi_data_bytes=*/64);
         for (int i = 0; i < 10; ++i) {
             w.Emit(1000 + i, kSharedBufferBase + i * 64, 64, kRead, 1);
         }
@@ -238,8 +446,12 @@ static void TestMetaSidecar() {
     std::fclose(f);
     CHECK(all.find("\"emitted\": 10") != std::string::npos,
           "meta 应记录 emitted=10");
+    CHECK(all.find("\"data_records\": 10") != std::string::npos,
+          "meta 应记录 data_records=10");
     CHECK(all.find("\"bytes\": 640") != std::string::npos,
           "meta 应记录 bytes=640");
+    CHECK(all.find("\"axi_data_bytes\": 64") != std::string::npos,
+          "meta 应记录总线宽度");
     CHECK(all.find("\"name\": \"vortex_meta\"") != std::string::npos,
           "meta 应含源名");
 }
@@ -315,6 +527,9 @@ int main() {
 
     TestDisabledWhenNoEnv();
     TestHeaderAndRoundTrip();
+    TestDataChannelProjection();
+    TestFullChannelTransactions();
+    TestFullChannelBurstKindsAndRejects();
     TestDramFilter();
     TestFilterAll();
     TestNonMonotonicDetected();

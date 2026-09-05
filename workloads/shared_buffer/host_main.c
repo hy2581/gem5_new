@@ -35,7 +35,7 @@
 #define NPU_CTRL    0x00u  // W: bit0 启动
 #define NPU_STATUS  0x04u  // R: bit0 halted, bit1 wfi, bit2 还在 tick
 #define NPU_ENTRY   0x08u  // R: load_elf 报的入口 PC
-#define NPU_EMITTED 0x0Cu  // R: 设备侧 tap 已写出的记录数
+#define NPU_EMITTED 0x0Cu  // R: 可选设备内诊断 tap 已写出的记录数
 #define NPU_MBOX0   0x10u  // R/W: mailbox[0..3]
 
 // ddr_touch.cc 里的完成标志高 16 位。
@@ -93,7 +93,7 @@ static int run_npu(void)
                spins, status);
         return 2;
     }
-    printf("host: NPU 停了, status=0x%x, 轮询 %u 次, 设备 tap 已写 %u 条\n",
+    printf("host: NPU 停了, status=0x%x, 轮询 %u 次, 设备内诊断 tap 已写 %u 条\n",
            status, spins, *npu_reg(NPU_EMITTED));
 
     // 结果核对。out[i] = in[i]*2+1 是 ddr_touch.cc 里的算法。

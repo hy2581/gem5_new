@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import io
+import csv
+import json
 import os
 import re
 import shutil
@@ -20,13 +22,33 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from hettrace import addrmap, convert, merge, reader, stats, synth, validate  # noqa: E402
+from hettrace import (  # noqa: E402
+    addrmap,
+    convert,
+    merge,
+    reader,
+    stats,
+    synth,
+    validate,
+)
 from hettrace.reader import (  # noqa: E402
+    CHAN_AR,
+    CHAN_AW,
+    CHAN_B,
+    CHAN_R,
+    CHAN_W,
+    FLAG_DMA,
+    FLAG_BURST_BEAT,
+    FLAG_LAST,
+    FLAG_SYNTH,
+    FORMAT_VERSION,
     OP_READ,
     OP_WRITE,
+    RECORD_SIZE,
     TraceError,
     discover,
     read_header,
+    read_data_records,
     read_records,
 )
 
@@ -46,6 +68,36 @@ def check(cond, msg):
 
 def tmpdir():
     return tempfile.mkdtemp(prefix="hettrace_py_")
+
+
+def rewrite_header(path, **changes):
+    """测试专用：同步改二进制 header 与 meta，构造一致但语义错误的输入。"""
+    fields = (
+        "magic", "version", "record_size", "ticks_per_second",
+        "clock_period_ticks", "src_id", "level", "flags",
+        "axi_data_bytes", "axi_addr_bits", "name",
+    )
+    with open(path, "r+b") as handle:
+        raw = handle.read(reader.HEADER_SIZE)
+        values = list(reader._HEADER_STRUCT.unpack(raw))
+        for key, value in changes.items():
+            index = fields.index(key)
+            if key == "name":
+                value = value.encode()[:23].ljust(24, b"\x00")
+            values[index] = value
+        handle.seek(0)
+        handle.write(reader._HEADER_STRUCT.pack(*values))
+
+    meta_path = path + ".meta.json"
+    if os.path.exists(meta_path):
+        with open(meta_path, encoding="utf-8") as handle:
+            meta = json.load(handle)
+        for key, value in changes.items():
+            if key in meta:
+                meta[key] = value
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, indent=2)
+            handle.write("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +217,51 @@ def test_synth_roundtrip():
         shutil.rmtree(d)
 
 
+def test_synth_axi_full_roundtrip():
+    """五通道合成流必须逐字段可读，并通过结构校验。"""
+    d = tmpdir()
+    try:
+        synth.gen_axi_full(d, n=6)
+        issues, summaries = validate.validate_dir(d)
+        errors = [issue for issue in issues if issue.level == "ERROR"]
+        check(not errors, "健康五通道 trace 不应有 ERROR，实际: %r" % errors)
+        check(len(summaries) == 3, "五通道场景应覆盖三个源")
+
+        expected_channels = {CHAN_AW, CHAN_W, CHAN_B, CHAN_AR, CHAN_R}
+        for path, header in discover(d):
+            records = list(read_records(path))
+            check(header.version == FORMAT_VERSION,
+                  "%s 应写 v%d header" % (header.name, FORMAT_VERSION))
+            check(header.record_size == RECORD_SIZE,
+                  "%s record_size 应为 %d" % (header.name, RECORD_SIZE))
+            check(header.level == addrmap.LEVELS["interconnect"],
+                  "%s 应标为 interconnect tap" % header.name)
+            channels = {record.chan for record in records}
+            if header.name == "host":
+                check({CHAN_AW, CHAN_W, CHAN_B}.issubset(channels),
+                      "host 写事务应含 AW/W/B")
+            else:
+                check({CHAN_AR, CHAN_R}.issubset(channels),
+                      "%s 读事务应含 AR/R" % header.name)
+            check(channels.issubset(expected_channels), "不应出现未知 AXI 通道")
+            check(len(list(read_data_records(path))) < len(records),
+                  "%s 五通道投影应滤掉控制记录" % header.name)
+            check(all(record.flags & FLAG_SYNTH for record in records),
+                  "%s 的统一 gem5 monitor AXI 字段应标 synth"
+                  % header.name)
+
+        vortex_path = os.path.join(d, "vortex.hettrace")
+        vortex_records = list(read_records(vortex_path))
+        ar = next(record for record in vortex_records if record.chan == CHAN_AR)
+        r = next(
+            record for record in vortex_records
+            if record.chan == CHAN_R and record.txn == ar.txn
+        )
+        check(r.tick > ar.tick, "R 必须在 AR 之后，trace 才保留读延迟")
+    finally:
+        shutil.rmtree(d)
+
+
 def test_merge_is_totally_ordered():
     d = tmpdir()
     try:
@@ -228,6 +325,27 @@ def test_truncated_file_raises():
         shutil.rmtree(d)
 
 
+def test_discover_rejects_bad_candidate_header():
+    """名字已经是 *.hettrace 的坏文件不能被静默忽略。"""
+    d = tmpdir()
+    try:
+        with open(os.path.join(d, "damaged.hettrace"), "wb") as handle:
+            handle.write(b"not-a-header")
+        try:
+            discover(d)
+            check(False, "discover 应拒绝损坏的 trace 候选文件")
+        except TraceError as exc:
+            check("damaged.hettrace" in str(exc),
+                  "discover 错误应点名损坏文件: %s" % exc)
+
+        issues, _summaries = validate.validate_dir(d)
+        check(any(i.level == "ERROR" and "damaged.hettrace" in i.message
+                  for i in issues),
+              "validate 应把坏 header 报为 ERROR")
+    finally:
+        shutil.rmtree(d)
+
+
 # ---------------------------------------------------------------------------
 # validate 必须抓住每种失效形态
 # ---------------------------------------------------------------------------
@@ -277,6 +395,26 @@ def test_validate_accepts_bar_pair():
         _sizes, pairwise, _lb = stats.footprint(d)
         check(pairwise.get(("host", "vortex"), 0) > 0,
               "两源经 BAR 应量出共享 cache line，实际 %r" % pairwise)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_explicit_single_source_mode():
+    d = tmpdir()
+    try:
+        synth.gen_cooperative(d, n_per_src=10)
+        for name in ("vortex", "coralnpu"):
+            os.remove(os.path.join(d, name + ".hettrace"))
+            os.remove(os.path.join(d, name + ".hettrace.meta.json"))
+        _issues, summaries = validate.validate_dir(
+            d, require_heterogeneous=False
+        )
+        errors = [issue for issue in _issues if issue.level == "ERROR"]
+        check(not errors, "显式单源模式不应报跨源 ERROR，实际: %r" % errors)
+        check(len(summaries) == 1, "显式单源模式应保留一个汇总")
+        infos = [issue.message for issue in _issues if issue.level == "INFO"]
+        check(any("单源诊断模式" in message for message in infos),
+              "报告应明确标注单源诊断模式")
     finally:
         shutil.rmtree(d)
 
@@ -332,6 +470,318 @@ def test_validate_catches_seq_gap():
         _i, _s, errs, _w = _run_validate(d)
         check(any("seq" in e.message for e in errs),
               "应报出 seq 断裂，实际: %r" % [e.message for e in errs])
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_catches_axi_orphan():
+    d = tmpdir()
+    try:
+        synth.gen_broken_axi_orphan(d)
+        _issues, _summaries, errors, _warnings = _run_validate(d)
+        check(any("数据拍找不到" in error.message for error in errors),
+              "应报出没有对应 AR 的孤儿 R，实际: %r"
+              % [error.message for error in errors])
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_catches_axi_beat_contract():
+    """逐拍抓 ID/地址/大小/LAST/WSTRB 以及少拍、多拍。"""
+    d = tmpdir()
+    try:
+        shared = addrmap.REGIONS["shared_buffer"][0]
+        writer = synth.SynthWriter(
+            d, "host", level="interconnect", axi_data_bytes=16,
+            synth_flag=True,
+        )
+
+        # txn 0 声明 2 拍，但只给 1 拍就回 B；该拍还故意改坏
+        # ID、地址、size、LAST 和 WSTRB。
+        writer._push(1000, shared, 0, 32, 7, 0, 1, OP_WRITE, CHAN_AW,
+                     1, 4, 0, 0)
+        writer._push(1100, shared + 16, 1 << 63, 8, 7, 0, 2, OP_WRITE,
+                     CHAN_W, 1, 4, 0, FLAG_LAST)
+        writer._push(1200, shared, 0, 0, 7, 0, 1, OP_WRITE, CHAN_B,
+                     1, 4, 0, FLAG_LAST)
+
+        # txn 1 只声明 1 拍，却给两拍。
+        writer._push(2000, shared + 64, 0, 16, 8, 1, 3, OP_WRITE,
+                     CHAN_AW, 0, 4, 0, 0)
+        writer._push(2100, shared + 64, 0xffff, 16, 8, 1, 3, OP_WRITE,
+                     CHAN_W, 0, 4, 0, FLAG_LAST)
+        writer._push(2200, shared + 80, 0xffff, 16, 8, 1, 3, OP_WRITE,
+                     CHAN_W, 0, 4, 0, FLAG_LAST)
+        writer._push(2300, shared + 64, 0, 0, 8, 1, 3, OP_WRITE,
+                     CHAN_B, 0, 4, 0, FLAG_LAST)
+        writer.close()
+
+        issues, _summaries = validate.validate_dir(
+            d, require_heterogeneous=False
+        )
+        text_ = "\n".join(i.message for i in issues if i.level == "ERROR")
+        for category in (
+            "field_mismatch", "beat_size", "beat_address", "beat_flags",
+            "write_strobe", "missing_data", "extra_data",
+        ):
+            check(category in text_, "validator 应报出 %s: %s" % (category, text_))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_catches_data_only_beat_contract():
+    """没有 AW/AR 的设备投影也必须校验宽度、strobe 与拍组形状。"""
+    d = tmpdir()
+    try:
+        shared = addrmap.REGIONS["shared_buffer"][0]
+        writer = synth.SynthWriter(
+            d, "host", level="post_llc", axi_data_bytes=16
+        )
+
+        # 非零 RSTRB。
+        writer._push(1000, shared, 1, 16, 0, 0, 0, OP_READ,
+                     CHAN_R, 0, 4, 0, FLAG_LAST)
+        # 128B beat 放在 16B 总线上。
+        writer._push(1100, shared + 0x100, 0xffff, 128, 0, 1, 0,
+                     OP_WRITE, CHAN_W, 0, 7, 0, FLAG_LAST)
+        # 单拍 R 缺 LAST。
+        writer._push(1200, shared + 0x200, 0, 16, 0, 2, 0, OP_READ,
+                     CHAN_R, 0, 4, 0, 0)
+        # 两拍投影的第二拍地址与 BURST_BEAT 都故意错误。
+        writer._push(1300, shared + 0x300, 0xffff, 16, 0, 3, 0,
+                     OP_WRITE, CHAN_W, 1, 4, 0, 0)
+        writer._push(1400, shared + 0x320, 0xffff, 16, 0, 3, 0,
+                     OP_WRITE, CHAN_W, 1, 4, 0, FLAG_LAST)
+        writer.close()
+
+        issues, _summaries = validate.validate_dir(
+            d, require_heterogeneous=False
+        )
+        text_ = "\n".join(
+            issue.message for issue in issues if issue.level == "ERROR"
+        )
+        for category in (
+            "read_strobe", "beat_width", "beat_flags", "beat_address"
+        ):
+            check(category in text_,
+                  "设备级 validator 应报出 %s: %s" % (category, text_))
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_rejects_mixed_capture_levels():
+    """逐源 level 都合法，也不能把 interconnect 与设备 tap 混为一批。"""
+    d = tmpdir()
+    try:
+        shared = addrmap.REGIONS["shared_buffer"][0]
+        host = synth.SynthWriter(d, "host", level="interconnect")
+        vortex = synth.SynthWriter(d, "vortex", level="post_llc")
+        for i in range(2):
+            host.emit(1000 + i * 100, shared + i * 64, 64, OP_WRITE)
+            vortex.emit(1050 + i * 100, shared + i * 64, 64, OP_READ)
+        host.close()
+        vortex.close()
+
+        issues, _summaries = validate.validate_dir(d)
+        check(any(
+            issue.level == "ERROR" and "混用了不同观察层级" in issue.message
+            for issue in issues
+        ), "同一批跨源 trace 的 level 不一致必须报 ERROR")
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_catches_full_axi_header_and_control_edges():
+    """覆盖 EXOKAY、非法 RESP/FIXED、unaligned 与地址位宽。"""
+    d = tmpdir()
+    try:
+        shared = addrmap.REGIONS["shared_buffer"][0]
+        writer = synth.SynthWriter(
+            d, "host", level="interconnect", axi_data_bytes=16,
+            synth_flag=True,
+        )
+        # EXOKAY 是成功响应，不应被计为 slave/decoder error。
+        writer.emit_txn(
+            1000, 1100, shared, 16, OP_READ, axi_id=1, resp=1
+        )
+        # 17 拍 FIXED 超过 AXI4 上限 16。
+        writer._push(
+            1200, shared + 0x100, 0, 17 * 16, 0, 10, 2,
+            OP_READ, CHAN_AR, 16, 4, 0, 0, burst=0,
+        )
+        # 当前无 RSTRB 的可转换契约显式拒绝 unaligned 地址通道。
+        writer._push(
+            1300, shared + 0x203, 0, 8, 0, 11, 3,
+            OP_READ, CHAN_AR, 1, 2, 0, 0,
+        )
+        # RESP=4 不在 AXI4 编码内，必须是协议 ERROR 而非普通 warning。
+        writer._push(
+            1400, shared + 0x300, 0, 4, 0, 12, 4,
+            OP_READ, CHAN_R, 0, 2, 4, FLAG_LAST,
+        )
+        writer.close()
+
+        issues, summaries = validate.validate_dir(
+            d, require_heterogeneous=False
+        )
+        errors = "\n".join(
+            issue.message for issue in issues if issue.level == "ERROR"
+        )
+        for category in ("bad_burst", "address_alignment", "bad_resp"):
+            check(category in errors,
+                  "完整 AXI 边界测试应报出 %s: %s" % (category, errors))
+        check(summaries[0].resp_errors == 0,
+              "EXOKAY 与非法编码都不能误计为 SLVERR/DECERR")
+        check(not any(
+            issue.level == "WARN" and "SLVERR/DECERR" in issue.message
+            for issue in issues
+        ), "EXOKAY 不应产生错误响应 warning")
+
+        records = iter(list(read_records(writer.path))[3:4])
+        try:
+            convert.convert_memsim(records, io.StringIO(), 100)
+            check(False, "unaligned AR 必须被 memsim converter 拒绝")
+        except convert.ConvertError as exc:
+            check("unaligned" in str(exc),
+                  "unaligned 转换错误应解释 RSTRB 限制: %s" % exc)
+    finally:
+        shutil.rmtree(d)
+
+    d = tmpdir()
+    try:
+        bar = addrmap.REGIONS["vortex_bar"][0]
+        writer = synth.SynthWriter(
+            d, "host", level="interconnect", axi_data_bytes=16,
+            synth_flag=True,
+        )
+        writer._push(
+            1000, bar, 0, 16, 0, 0, 0,
+            OP_READ, CHAN_AR, 0, 4, 0, 0,
+        )
+        writer.close()
+        rewrite_header(writer.path, axi_addr_bits=32)
+        issues, _summaries = validate.validate_dir(
+            d, require_heterogeneous=False
+        )
+        check(any(
+            issue.level == "ERROR" and "address_span" in issue.message
+            for issue in issues
+        ), "只有地址通道时也必须按 axi_addr_bits 检查整笔范围")
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_catches_axi4_ordering_rules():
+    """W 服从全局 AW 顺序，B/R 对同一 ID 不能重排。"""
+    d = tmpdir()
+    try:
+        shared = addrmap.REGIONS["shared_buffer"][0]
+        writer = synth.SynthWriter(
+            d, "host", level="interconnect", axi_data_bytes=16,
+            synth_flag=True,
+        )
+
+        # 两个写地址先后发出，却先发送第二笔 W；随后 B 也按同一 ID 逆序。
+        for txn, address in ((0, shared), (1, shared + 16)):
+            writer._push(
+                1000 + txn * 10, address, 0, 16, 0, txn, 7,
+                OP_WRITE, CHAN_AW, 0, 4, 0, 0,
+            )
+        for txn, address in ((1, shared + 16), (0, shared)):
+            writer._push(
+                1100 + (1 - txn) * 10, address, 0xffff, 16, 0, txn, 7,
+                OP_WRITE, CHAN_W, 0, 4, 0, FLAG_LAST,
+            )
+        for txn, address in ((1, shared + 16), (0, shared)):
+            writer._push(
+                1200 + (1 - txn) * 10, address, 0, 0, 0, txn, 7,
+                OP_WRITE, CHAN_B, 0, 4, 0, FLAG_LAST,
+            )
+
+        # 同一 ID 的两笔读先后发出，却让第二笔 R 先返回。
+        for txn, address in ((2, shared + 32), (3, shared + 48)):
+            writer._push(
+                1300 + (txn - 2) * 10, address, 0, 16, 0, txn, 9,
+                OP_READ, CHAN_AR, 0, 4, 0, 0,
+            )
+        for txn, address in ((3, shared + 48), (2, shared + 32)):
+            writer._push(
+                1400 + (3 - txn) * 10, address, 0, 16, 0, txn, 9,
+                OP_READ, CHAN_R, 0, 4, 0, FLAG_LAST,
+            )
+        writer.close()
+
+        issues, _summaries = validate.validate_dir(
+            d, require_heterogeneous=False
+        )
+        errors = "\n".join(
+            issue.message for issue in issues if issue.level == "ERROR"
+        )
+        check("write_data_order" in errors,
+              "W 逆序必须报 write_data_order: %s" % errors)
+        check("response_order" in errors,
+              "同 ID B/R 逆序必须报 response_order: %s" % errors)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_rejects_wrong_global_timebase_and_source_name():
+    d = tmpdir()
+    try:
+        writer = synth.SynthWriter(d, "vortex")
+        writer.emit(
+            1000, addrmap.REGIONS["vortex_vram"][0], 64, OP_READ
+        )
+        writer.close()
+        rewrite_header(
+            writer.path,
+            ticks_per_second=2 * addrmap.TICKS_PER_SECOND,
+            name="not-vortex",
+        )
+        issues, _summaries = validate.validate_dir(
+            d, require_heterogeneous=False
+        )
+        messages = "\n".join(
+            issue.message for issue in issues if issue.level == "ERROR"
+        )
+        check("ticks_per_second" in messages,
+              "错误全局 tick 基准必须报 ERROR: %s" % messages)
+        check("规范名" in messages,
+              "header name/src_id 不一致必须报 ERROR: %s" % messages)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_rejects_duplicate_source_ids():
+    d = tmpdir()
+    try:
+        synth.gen_cooperative(d, n_per_src=2)
+        shutil.copyfile(
+            os.path.join(d, "host.hettrace"),
+            os.path.join(d, "host-copy.hettrace"),
+        )
+        issues, _summaries = validate.validate_dir(d)
+        check(any(i.level == "ERROR" and "src_id=0" in i.message
+                  and "重复" in i.message for i in issues),
+              "重复 src_id 必须报 ERROR")
+    finally:
+        shutil.rmtree(d)
+
+
+def test_validate_sees_filtered_unmapped_in_meta():
+    """默认过滤不得把未映射地址伪装成普通 filtered。"""
+    d = tmpdir()
+    try:
+        writer = synth.SynthWriter(d, "host")
+        writer.emit(1000, addrmap.REGIONS["shared_buffer"][0], 8, OP_READ)
+        writer.emit(1100, 0xDEADBEEF, 8, OP_READ)
+        writer.close()
+        issues, _summaries = validate.validate_dir(
+            d, require_heterogeneous=False
+        )
+        check(any(i.level == "ERROR" and "meta 记录 1 次未映射" in i.message
+                  for i in issues),
+              "被 filter 拦下的未映射访问仍必须由 meta 报 ERROR")
     finally:
         shutil.rmtree(d)
 
@@ -414,6 +864,158 @@ def test_convert_presets():
     finally:
         shutil.rmtree(d)
 
+    d = tmpdir()
+    try:
+        synth.gen_axi_full(d, n=2)
+        records, _ = merge.merge_dir(d)
+        data_only = io.StringIO()
+        n_data = convert.convert(
+            records, data_only, convert.PRESETS["readwrite"]["template"]
+        )
+        records, _ = merge.merge_dir(d)
+        all_channels = io.StringIO()
+        n_all = convert.convert(
+            records,
+            all_channels,
+            "{chan} {addr:#x}",
+            include_control=True,
+        )
+        check(n_data == 2 * (4 + 4 + 1),
+              "通用转换默认只应输出 W/R 数据拍，实为 %d" % n_data)
+        check(n_all > n_data, "--include-control 应额外保留 AW/B/AR")
+    finally:
+        shutil.rmtree(d)
+
+
+# ---------------------------------------------------------------------------
+# 外部 mem_sim 投影
+# ---------------------------------------------------------------------------
+def test_convert_memsim_projection_and_mapping():
+    """完整 AXI 从 AW/AR 发射时刻投影；设备 trace 则回退到 W/R。"""
+    d = tmpdir()
+    try:
+        synth.gen_axi_full(d, n=4)
+        records, _entries = merge.merge_dir(d)
+        output = io.StringIO()
+        mapping = io.StringIO()
+        count = convert.convert_memsim(
+            records, output, 100, map_fh=mapping
+        )
+
+        # 每轮 host 64B 写 4 拍、Vortex 64B 读 4 拍、NPU 16B 读 1 拍。
+        check(count == 4 * (4 + 4 + 1),
+              "AXI 地址通道展开数应为 36，实为 %d" % count)
+        lines = output.getvalue().strip().splitlines()
+        cycles = [int(line.split()[0]) for line in lines]
+        check(cycles == sorted(cycles), "mem_sim inject_cycle 必须非递减")
+        check(all(line.split()[1] in ("R", "W") for line in lines),
+              "mem_sim 第二列必须为 R/W")
+
+        rows = list(csv.DictReader(io.StringIO(mapping.getvalue())))
+        check(len(rows) == count, "映射 sidecar 应与请求逐行对应")
+        check([int(row["host_request_id"]) for row in rows]
+              == list(range(count)), "host_request_id 必须零起始连续")
+        check(
+            all(row["projection"] in
+                ("axi_write_data", "axi_read_address") for row in rows),
+            "完整 trace 必须从 W/AR 投影",
+        )
+        check(any(row["projection"] == "axi_write_data" for row in rows),
+              "写请求必须从 W 投影以保留 WSTRB")
+        check(any(row["projection"] == "axi_read_address" for row in rows),
+              "读请求必须从 AR 投影以保留发射 tick")
+
+        # W 的 mapping 必须能逐拍回溯，同一 txn 不能全部写成 beat=0。
+        host_write_rows = [
+            row for row in rows
+            if row["src_name"] == "host"
+            and row["projection"] == "axi_write_data"
+        ]
+        first_write_txn = host_write_rows[0]["txn"]
+        first_write_beats = [
+            int(row["beat"]) for row in host_write_rows
+            if row["txn"] == first_write_txn
+        ]
+        check(first_write_beats == [0, 1, 2, 3],
+              "完整写事务的 mapping beat 应逐拍递增，实为 %r"
+              % first_write_beats)
+
+        first_vortex = next(row for row in rows if row["src_name"] == "vortex")
+        check(int(first_vortex["tick"]) == 1100,
+              "Vortex 读请求必须使用 AR tick，而不是较晚的 R tick")
+
+        # data=/expect= 的十六进制字节数必须与 sidecar.size
+        # 逐行一致，否则 mem_sim 会回退到 64B line_size。
+        for line, row in zip(lines, rows):
+            tokens = line.split()
+            size = int(row["size"])
+            payload_token = next(
+                token for token in tokens
+                if token.startswith("data=") or token.startswith("expect=")
+            )
+            check(len(payload_token.split("=", 1)[1]) == size * 2,
+                  "mem_sim payload/expect 必须精确携带 %dB" % size)
+            if tokens[1] == "W":
+                mask_token = next(token for token in tokens
+                                  if token.startswith("mask="))
+                check(len(mask_token.split("=", 1)[1]) == size * 2,
+                      "mem_sim 写 mask 必须与 payload 等长")
+
+        # 设备 tap 只有 W/R；转换器必须仍然能直接使用，不能要求伪造 AW/AR。
+        d2 = tmpdir()
+        try:
+            synth.gen_cooperative(d2, n_per_src=3)
+            records2, _ = merge.merge_dir(d2)
+            output2 = io.StringIO()
+            mapping2 = io.StringIO()
+            count2 = convert.convert_memsim(
+                records2, output2, 100, map_fh=mapping2
+            )
+            check(count2 == 3 * (2 + 3 + 2),
+                  "设备级 W/R 投影请求数应守恒，实为 %d" % count2)
+            rows2 = list(csv.DictReader(io.StringIO(mapping2.getvalue())))
+            check(all(row["projection"] == "data" for row in rows2),
+                  "设备级 trace 应标明从 data channel 投影")
+        finally:
+            shutil.rmtree(d2)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_convert_memsim_preserves_partial_wstrb():
+    d = tmpdir()
+    try:
+        shared = addrmap.REGIONS["shared_buffer"][0] + 8
+        writer = synth.SynthWriter(
+            d, "host", level="interconnect", axi_data_bytes=16,
+            synth_flag=True,
+        )
+        writer._push(100, shared, 0, 4, 1, 0, 5, OP_WRITE, CHAN_AW,
+                     0, 2, 0, 0)
+        writer._push(110, shared, (1 << 8) | (1 << 10), 4, 1, 0, 5,
+                     OP_WRITE, CHAN_W, 0, 2, 0, FLAG_LAST)
+        writer._push(120, shared, 0, 0, 1, 0, 5, OP_WRITE, CHAN_B,
+                     0, 2, 0, FLAG_LAST)
+        writer.close()
+
+        records, entries = merge.merge_dir(d)
+        output = io.StringIO()
+        mapping = io.StringIO()
+        count = convert.convert_memsim(
+            records, output, 10, map_fh=mapping,
+            axi_data_bytes_by_src={entries[0][1].src_id: 16},
+        )
+        check(count == 1, "单拍部分写应投影为 1 条 mem_sim 请求")
+        line = output.getvalue().strip()
+        check("data=00000000" in line, "4B 写应用 4B dummy payload 携带大小")
+        check("mask=ff00ff00" in line,
+              "全局 WSTRB lane 8/10 应投影成相对 mask ff00ff00: %s" % line)
+        row = next(csv.DictReader(io.StringIO(mapping.getvalue())))
+        check(row["projection"] == "axi_write_data" and row["size"] == "4",
+              "sidecar 应标明 W 投影与精确尺寸")
+    finally:
+        shutil.rmtree(d)
+
 
 def test_cli_end_to_end():
     """跑真正的命令行，捕捉 import / 参数解析层面的问题。"""
@@ -439,6 +1041,19 @@ def test_cli_end_to_end():
                   "hettrace %s 应返回 %d，实为 %d\nstderr:\n%s"
                   % (" ".join(args[:2]), want_rc, r.returncode, r.stderr))
 
+        # mem_sim 是 convert 的一个预设；-o 时自动生成 request-id 映射。
+        memsim_path = os.path.join(d, "mem_sim.trace")
+        r = subprocess.run(
+            [sys.executable, "-m", "hettrace", "convert", d,
+             "--preset", "memsim", "--ticks-per-cycle", "100",
+             "-o", memsim_path],
+            capture_output=True, text=True, env=env, cwd=ROOT,
+        )
+        check(r.returncode == 0, "memsim convert CLI 应通过:\n%s" % r.stderr)
+        check(os.path.getsize(memsim_path) > 100, "mem_sim trace 不应为空")
+        map_path = memsim_path + ".map.csv"
+        check(os.path.getsize(map_path) > 100, "request-id 映射不应为空")
+
         # 坏 trace 应让 validate 以非零退出，这样能直接用于 CI 门禁
         d2 = tmpdir()
         try:
@@ -450,6 +1065,59 @@ def test_cli_end_to_end():
             check(r.returncode != 0, "坏 trace 应让 validate 非零退出")
         finally:
             shutil.rmtree(d2)
+    finally:
+        shutil.rmtree(d)
+
+
+def test_llm_memory_benchmark_generator():
+    """LLM benchmark 必须产出三源、合法、可重复分析的标准 HETTrace。"""
+    d = tmpdir()
+    try:
+        trace_dir = os.path.join(d, "traces")
+        script = os.path.join(ROOT, "workloads", "llm_memory", "generate_trace.py")
+        r = subprocess.run(
+            [
+                sys.executable,
+                script,
+                "--output", trace_dir,
+                "--hidden-size", "32",
+                "--layers", "2",
+                "--context-tokens", "4",
+                "--decode-tokens", "2",
+                "--layer-gap", "1000",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            timeout=60,
+        )
+        check(r.returncode == 0, "LLM trace 生成器应通过:\n%s%s" % (r.stdout, r.stderr))
+        if r.returncode != 0:
+            return
+
+        entries = discover(trace_dir)
+        check([header.name for _path, header in entries]
+              == ["host", "vortex", "coralnpu"],
+              "LLM benchmark 应生成规范的三源 trace")
+        issues, summaries = validate.validate_dir(trace_dir)
+        errors = [issue for issue in issues if issue.level == "ERROR"]
+        check(not errors, "LLM benchmark trace 应通过 validate，实际: %r" % errors)
+
+        with open(os.path.join(trace_dir, "benchmark.json")) as handle:
+            manifest = json.load(handle)
+        total = sum(values["requests"]
+                    for values in manifest["source_stats"].values())
+        observed = sum(summary.count for summary in summaries)
+        check(total == observed and total > 0,
+              "manifest 请求数应与三份 trace 守恒: %d vs %d" % (total, observed))
+        check(manifest["functional_model"] is False,
+              "LLM benchmark 必须机器可读地声明不是功能模型")
+
+        records, _entries = merge.merge_dir(trace_dir)
+        memsim_trace = io.StringIO()
+        count = convert.convert_memsim(records, memsim_trace, 100)
+        check(count == total,
+              "LLM trace 转为外部 mem_sim 请求后数量必须守恒")
     finally:
         shutil.rmtree(d)
 
@@ -486,6 +1154,7 @@ def test_cli_rejects_bad_args():
             ["stats", d, "--line", "0"],
             ["stats", d, "--window", "-1"],
             ["stats", d, "-n", "-1"],
+            ["convert", d, "--preset", "memsim", "--ticks-per-cycle", "0"],
         ):
             r = run(args)
             check(r is not None,
@@ -509,6 +1178,31 @@ def test_cli_rejects_bad_args():
                   "--sources nosuch 不应打 traceback:\n%s" % r.stderr)
             check("coralnpu" in r.stderr,
                   "--sources 的错误信息里应列出可用源名:\n%s" % r.stderr)
+
+        r = run(["convert", d, "--preset", "memsim"])
+        check(r is not None and r.returncode == 1,
+              "memsim 预设缺少时钟换算应以 1 退出")
+        if r is not None:
+            check("Traceback" not in r.stderr and "ticks-per-cycle" in r.stderr,
+                  "缺少时钟换算应给干净错误:\n%s" % r.stderr)
+
+        r = run(["convert", d, "--preset", "memsim",
+                 "--ticks-per-cycle", "100", "--sources", "nosuch"])
+        check(r is not None and r.returncode == 1,
+              "memsim convert 未知源应以 1 退出")
+        if r is not None:
+            check("Traceback" not in r.stderr and "coralnpu" in r.stderr,
+                  "memsim convert 未知源应列出可用名字:\n%s" % r.stderr)
+
+        same = os.path.join(d, "same.out")
+        r = run(["convert", d, "--preset", "memsim",
+                 "--ticks-per-cycle", "100", "-o", same,
+                 "--map-output", same])
+        check(r is not None and r.returncode == 1,
+              "trace/map 同路径应以 1 退出")
+        if r is not None:
+            check("同一个文件" in r.stderr and "Traceback" not in r.stderr,
+                  "输出路径冲突应给干净错误:\n%s" % r.stderr)
 
         # 源名与数字 id 混用仍应正常工作
         r = run(["convert", d, "--sources", "vortex,2", "--preset", "timed"])

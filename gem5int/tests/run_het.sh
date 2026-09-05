@@ -1,5 +1,6 @@
 #!/bin/bash
-# 异构系统验收：host + CoralNPU 在 gem5 里协同跑一遍，两份 trace 必须能对齐。
+# 异构系统验收：host + CoralNPU 在 gem5 里协同跑一遍，统一 memory-side
+# monitor 分类出的两份 trace 必须能对齐。
 #
 #   GEM5_HOME=$HOME/gem5 CORALNPU_HOME=$HOME/coralnpu \
 #       gem5int/tests/run_het.sh
@@ -15,7 +16,7 @@
 #
 # 四步，最后一步是重点：
 #   1. 正向跑，看 host 程序自检通过、两份 trace 都落盘。
-#   2. 两份 meta.json 的计数器（emitted/unmapped/non_monotonic）逐项过一遍。
+#   2. 两份 meta.json 的层级、SYNTH 和计数器逐项过一遍。
 #   3. validate + stats：两个源都要在 shared_buffer 里留下记录，且共享 line 数 > 0。
 #   4. **反向对照**：--npu-no-share 让 NPU 的 AXI master 回落到库内私有数组。地址
 #      不变、trace 照样产出、看起来一切正常，但 host 的校验和必须对不上。如果这一
@@ -35,6 +36,8 @@ fail() { echo "错误: $*" >&2; exit 1; }
 
 [ -x "$GEM5_BIN" ] || fail "找不到 $GEM5_BIN，先 scons build/X86/gem5.opt"
 [ -f "$CONFIG" ]   || fail "找不到 $CONFIG，先跑 gem5int/install.sh"
+[ -f "$GEM5_HOME/build/X86/params/HetAxiMonitor.hh" ] || \
+    fail "gem5 缺少 HetAxiMonitor，先重新安装 gem5int 并编译"
 
 # host 程序每次都重编。它很小，而"改了 host_main.c 忘了 make"这种失败会表现成
 # 莫名其妙的校验和不符，很难查。
@@ -78,6 +81,7 @@ for f in host.hettrace coralnpu.hettrace; do
     [ -f "$OUT/$f" ] || fail "没有产出 $f"
     [ -f "$OUT/$f.meta.json" ] || fail "没有产出 $f.meta.json"
 done
+[ ! -e "$OUT/vortex.hettrace" ] || fail "未启用 Vortex，却生成了 vortex.hettrace"
 echo "  ok   host 自检通过，两份 trace 与侧车文件都在"
 
 # ---- 2. 侧车计数器 ---------------------------------------------------------
@@ -100,6 +104,14 @@ for m, name, period in ((host, "host", 500), (npu, "coralnpu", 2000)):
     # host 2GHz -> 500 tick/周期, NPU 500MHz -> 2000。对不上说明 clk_domain 没生效。
     if m["clock_period_ticks"] != period:
         bad.append(f"{name}: clock_period_ticks={m['clock_period_ticks']}，期望 {period}")
+    if m.get("level") != 3:
+        bad.append(f"{name}: level={m.get('level')}，期望 3 (interconnect)")
+    if m.get("axi_data_bytes") != 16:
+        bad.append(f"{name}: axi_data_bytes={m.get('axi_data_bytes')}，期望 16")
+if host.get("synth") is not True:
+    bad.append(f"host: synth={host.get('synth')}，packet 投影必须标 SYNTH")
+if npu.get("synth") is not True:
+    bad.append(f"coralnpu: synth={npu.get('synth')}，统一 packet monitor 重构的五通道必须标 SYNTH")
 # 同一个时间基准的判据：NPU 是 host 写 REG_CTRL 之后才开始跑的，而 host 一直轮询到
 # 它停下，所以 NPU 的整个区间必须套在 host 的区间**里面**。如果设备库自己数周期
 # （从 0 开始）而不是用 gem5 的 curTick()，这一条立刻不成立。
@@ -110,7 +122,7 @@ for b in bad:
     print(f"  FAIL {b}")
 if not bad:
     print(f"  ok   host {host['emitted']} 条 / coralnpu {npu['emitted']} 条，"
-          f"unmapped=0 non_monotonic=0")
+          f"level=interconnect, SYNTH=true, unmapped=0 non_monotonic=0")
     print(f"  ok   NPU 区间 [{npu['first_tick']}, {npu['last_tick']}] 落在 host 区间内"
           f"，两边同一个 curTick()")
 sys.exit(1 if bad else 0)

@@ -51,7 +51,8 @@
 // 与 coralnpuint/ddr_touch.cc 的 kIn/kOut 必须一致。
 static constexpr uint32_t kSharedIn  = 0x90000000u;
 static constexpr uint32_t kSharedOut = 0x90001000u;
-static constexpr uint32_t kWords     = 64;
+static constexpr uint32_t kNpuWords  = 64;  // ddr_touch.elf 的固定协议长度
+static constexpr uint32_t kGpuWords  = 4;   // 覆盖全路径，同时让 timing 回归可快速完成
 
 // ---- addrmap.json: regions.npu_pio + coralnpu_dev.hh 的 Reg 枚举 ----------
 static constexpr uint32_t kNpuPio     = 0x30000000u;
@@ -125,17 +126,18 @@ int main(int argc, char** argv) {
     // NPU 那一份直接写共享区。这 64 次写是 uncacheable 的，每一次都以独立的包穿过
     // LLC 之下的探针，于是 host trace 里能看到 64 条落在 shared_buffer 的写。
     uint32_t npu_expect_sum = 0;
-    for (uint32_t i = 0; i < kWords; ++i) {
+    for (uint32_t i = 0; i < kNpuWords; ++i) {
         in_buf[i] = pattern(i);
         npu_expect_sum += pattern(i);
     }
     // out[] 清零：这样"NPU 一个字都没写"和"NPU 写错了"在 out[] 上是可区分的。
-    for (uint32_t i = 0; i < kWords; ++i) {
+    for (uint32_t i = 0; i < kNpuWords; ++i) {
         out_buf[i] = 0u;
     }
 
-    std::vector<float> h_src0(kWords), h_src1(kWords), h_dst(kWords, 0.0f);
-    for (uint32_t i = 0; i < kWords; ++i) {
+    std::vector<float> h_src0(kGpuWords), h_src1(kGpuWords),
+                       h_dst(kGpuWords, 0.0f);
+    for (uint32_t i = 0; i < kGpuWords; ++i) {
         h_src0[i] = static_cast<float>(pattern(i));
         h_src1[i] = static_cast<float>(i + 1);
     }
@@ -152,7 +154,7 @@ int main(int argc, char** argv) {
     vx_queue_h q = nullptr;
     VXCHECK(vx_queue_create(dev, &qi, &q));
 
-    const uint64_t buf_size = kWords * sizeof(float);
+    const uint64_t buf_size = kGpuWords * sizeof(float);
     vx_buffer_h src0_buf = nullptr, src1_buf = nullptr, dst_buf = nullptr;
     VXCHECK(vx_buffer_create(dev, buf_size, VX_MEM_READ,  &src0_buf));
     VXCHECK(vx_buffer_create(dev, buf_size, VX_MEM_READ,  &src1_buf));
@@ -164,7 +166,7 @@ int main(int argc, char** argv) {
     VXCHECK(vx_module_get_kernel(mod, "main", &kern));
 
     kernel_arg_t karg{};
-    karg.num_points = kWords;
+    karg.num_points = kGpuWords;
     VXCHECK(vx_buffer_address(src0_buf, &karg.src0_addr));
     VXCHECK(vx_buffer_address(src1_buf, &karg.src1_addr));
     VXCHECK(vx_buffer_address(dst_buf,  &karg.dst_addr));
@@ -176,7 +178,7 @@ int main(int argc, char** argv) {
     VXCHECK(vx_enqueue_write(q, src1_buf, 0, h_src1.data(), buf_size, 0, nullptr, nullptr));
 
     uint32_t grid[1], block[1];
-    const uint32_t nd_size = kWords;
+    const uint32_t nd_size = kGpuWords;
     VXCHECK(vx_device_max_occupancy_grid(dev, 1, &nd_size, grid, block));
 
     vx_launch_info_t li{};
@@ -216,7 +218,7 @@ int main(int argc, char** argv) {
         std::printf("host: 错误 —— 轮询 %u 次 NPU 仍未停 (status=0x%x)\n", spins, status);
         return 2;
     }
-    std::printf("host: NPU 停了, status=0x%x, 轮询 %u 次, 设备 tap 已写 %u 条\n",
+    std::printf("host: NPU 停了, status=0x%x, 轮询 %u 次, 设备内诊断 tap 已写 %u 条\n",
                 status, spins, *npu_reg(kNpuEmitted));
 
     // ---- 6. 收 Vortex 的结果 ----------------------------------------------
@@ -225,7 +227,7 @@ int main(int argc, char** argv) {
 
     // ---- 7. 两边分别核对 ---------------------------------------------------
     int bad = 0;
-    for (uint32_t i = 0; i < kWords; ++i) {
+    for (uint32_t i = 0; i < kNpuWords; ++i) {
         const uint32_t want = pattern(i) * 2u + 1u;
         const uint32_t got  = out_buf[i];
         if (got != want) {
@@ -236,7 +238,8 @@ int main(int argc, char** argv) {
         }
     }
     if (bad) {
-        std::printf("host: 错误 —— NPU 的 out[] 有 %d/%u 个字不对\n", bad, kWords);
+        std::printf("host: 错误 —— NPU 的 out[] 有 %d/%u 个字不对\n",
+                    bad, kNpuWords);
         return 3;
     }
 
@@ -259,7 +262,7 @@ int main(int argc, char** argv) {
 
     // Vortex：精确相等，不留容差。输入都 < 2^24，float 能精确表示，和也一样。
     bad = 0;
-    for (uint32_t i = 0; i < kWords; ++i) {
+    for (uint32_t i = 0; i < kGpuWords; ++i) {
         const uint32_t want = pattern(i) + i + 1u;
         const uint32_t got  = static_cast<uint32_t>(h_dst[i]);
         if (got != want || h_dst[i] != static_cast<float>(want)) {
@@ -270,11 +273,12 @@ int main(int argc, char** argv) {
         }
     }
     if (bad) {
-        std::printf("host: 错误 —— Vortex 的 dst[] 有 %d/%u 个字不对\n", bad, kWords);
+        std::printf("host: 错误 —— Vortex 的 dst[] 有 %d/%u 个字不对\n",
+                    bad, kGpuWords);
         return 7;
     }
     std::printf("host: Vortex ok (dst[0]=%.1f dst[%u]=%.1f)\n",
-                h_dst[0], kWords - 1, h_dst[kWords - 1]);
+                h_dst[0], kGpuWords - 1, h_dst[kGpuWords - 1]);
 
     // 收尾。vortex2 的对象是引用计数的，所以是 *_release 而不是 *_destroy。返回值
     // 刻意不查：上面两条腿已经核对完了，这里再返回个错误码只会把"算错了"和"没关干

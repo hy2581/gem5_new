@@ -4,7 +4,7 @@
 #   CORALNPU_HOME=$HOME/coralnpu coralnpuint/tests/run_smoke.sh
 #
 # 前提：coralnpuint/install.sh 已跑过，且
-#   bazel build //gem5int:libcoralnpu-gem5.so //tests/cocotb:wfi_slot_0.elf
+#   bazel build //gem5int:libcoralnpu-gem5.so //gem5int:ddr_touch.elf
 # 已完成。
 #
 # 会把 trace 写到一个临时 HETTRACE_DIR 并用 tools/hettrace 校验，所以这个脚本
@@ -59,15 +59,16 @@ ls -la "$OUT"
 if compgen -G "$OUT/*.hettrace" > /dev/null; then
     echo
     echo "---- hettrace validate ----"
-    # 单引号：句子里带引号，写成双引号会被 shell 吃掉那两个引号（引号内外拼接，
-    # 不报错、只是引号消失），读 log 的人反而以为工具输出的是别的话。
-    echo '注: 这里只跑了 CoralNPU 一个源，validate 报"只有 1 个源"是预期的 ——'
-    echo "    它在提醒你这不是异构 trace，而不是说这份 trace 本身有问题。"
-    echo
     export PYTHONPATH="$PROJ_DIR/tools${PYTHONPATH:+:$PYTHONPATH}"
-    # || true：validate 因为上面那条预期的 ERROR 会返回非 0，而 set -e 会就此
-    # 中断脚本，把后面的诊断和最终结论一起吞掉。
-    python3 -m hettrace validate "$OUT" 2>&1 | head -30 || true
+    set +e
+    VALIDATE_LOG=$(python3 -m hettrace validate "$OUT" --allow-single-source 2>&1)
+    VALIDATE_RC=$?
+    set -e
+    printf '%s\n' "$VALIDATE_LOG" | sed -n '1,30p'
+    if [ "$VALIDATE_RC" -ne 0 ]; then
+        echo "错误: 单源 trace 校验失败" >&2
+        RC=$VALIDATE_RC
+    fi
     echo
     echo "---- hettrace dump (前 6 条) ----"
     # dump 吃的是单个文件（它只解析记录，不看侧车），validate 吃的是目录。

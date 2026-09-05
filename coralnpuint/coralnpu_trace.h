@@ -64,7 +64,8 @@ class CoralNpuTraceTap {
     bool Open(TickProvider tick_fn, void* tick_ctx, int64_t addr_offset) {
         if (!writer_.Open(hettrace::kSrcCoralnpu, "coralnpu",
                           hettrace::kLevelAxiMaster,
-                          hettrace::kClockPeriodTicks_coralnpu)) {
+                          hettrace::kClockPeriodTicks_coralnpu,
+                          /*axi_data_bytes=*/kAxiBeatBytes)) {
             return false;
         }
         tick_fn_     = tick_fn;

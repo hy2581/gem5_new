@@ -4,7 +4,8 @@
     python3 -m hettrace merge     <trace_dir> [-o out.txt]
     python3 -m hettrace stats     <trace_dir> [--window TICKS] [--line BYTES]
     python3 -m hettrace dump      <trace_file> [-n N]
-    python3 -m hettrace convert   <trace_dir> --preset readwrite [-o out.trace]
+    python3 -m hettrace convert   <trace_dir> --preset memsim \
+        --ticks-per-cycle N [-o out.trace]
 """
 
 from __future__ import annotations
@@ -14,7 +15,17 @@ import os
 import sys
 
 from . import addrmap, convert as convert_mod, merge, stats, validate
-from .reader import OP_WRITE, TraceError, read_header, read_meta, read_records
+from .reader import (
+    CHAN_NAMES,
+    FLAG_DMA,
+    FLAG_INSTR,
+    FLAG_PREFETCH,
+    OP_WRITE,
+    TraceError,
+    read_header,
+    read_meta,
+    read_records,
+)
 
 
 def _positive_int(s):
@@ -37,8 +48,29 @@ def _nonneg_int(s):
     return v
 
 
+def _parse_sources(raw):
+    if not raw:
+        return None
+    source_ids = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if tok in addrmap.SOURCES:
+            source_ids.add(addrmap.SOURCES[tok][0])
+            continue
+        try:
+            source_ids.add(int(tok, 0))
+        except ValueError:
+            raise ValueError(
+                "--sources 里的 %r 既不是源名也不是数字 id。可用源名: %s"
+                % (tok, ", ".join(sorted(addrmap.SOURCES)))
+            )
+    return source_ids
+
+
 def cmd_validate(args):
-    issues, summaries = validate.validate_dir(args.trace_dir)
+    issues, summaries = validate.validate_dir(
+        args.trace_dir, require_heterogeneous=not args.allow_single_source
+    )
     print(validate.format_report(issues, summaries))
     return 1 if any(i.level == "ERROR" for i in issues) else 0
 
@@ -95,20 +127,28 @@ def cmd_dump(args):
                 meta.get("non_monotonic"),
             )
         )
-    print("# %-14s %-3s %-12s %6s %6s %6s %-6s %s" % (
-        "tick", "op", "addr", "size", "ctx", "seq", "flags", "region"))
+    print(
+        "# %-14s %-4s %-3s %-12s %6s %5s %7s %6s %6s %-6s %s"
+        % (
+            "tick", "chan", "op", "addr", "size", "id", "txn", "ctx",
+            "seq", "flags", "region",
+        )
+    )
     n = 0
     for r in read_records(args.trace_file):
         if args.count and n >= args.count:
             print("# ... (--count %d 截断)" % args.count)
             break
         print(
-            "  %-14d %-3s 0x%-10x %6d %6d %6d 0x%-4x %s"
+            "  %-14d %-4s %-3s 0x%-10x %6d %5d %7d %6d %6d 0x%-4x %s"
             % (
                 r.tick,
+                CHAN_NAMES.get(r.chan, "??"),
                 "W" if r.op == OP_WRITE else "R",
                 r.addr,
                 r.size,
+                r.axi_id,
+                r.txn,
                 r.ctx,
                 r.seq,
                 r.flags,
@@ -125,6 +165,7 @@ def cmd_convert(args):
         return 0
 
     template = args.template
+    selected_preset = None
     if template is None:
         if args.preset not in convert_mod.PRESETS:
             sys.stderr.write(
@@ -132,37 +173,90 @@ def cmd_convert(args):
                 % (args.preset, ", ".join(convert_mod.PRESETS))
             )
             return 1
+        selected_preset = args.preset
         template = convert_mod.PRESETS[args.preset]["template"]
 
-    srcs = None
-    if args.sources:
-        srcs = set()
-        for tok in args.sources.split(","):
-            tok = tok.strip()
-            if tok in addrmap.SOURCES:
-                srcs.add(addrmap.SOURCES[tok][0])
-                continue
-            try:
-                srcs.add(int(tok, 0))
-            except ValueError:
-                sys.stderr.write(
-                    "--sources 里的 %r 既不是源名也不是数字 id。可用源名: %s\n"
-                    % (tok, ", ".join(sorted(addrmap.SOURCES)))
-                )
-                return 1
+    try:
+        srcs = _parse_sources(args.sources)
+    except ValueError as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
 
     records, entries = merge.merge_dir(args.trace_dir)
     if not entries:
         sys.stderr.write("%s 下没有 trace 文件\n" % args.trace_dir)
         return 1
 
-    if args.output:
-        with open(args.output, "w") as fh:
-            n = convert_mod.convert(records, fh, template, srcs)
-        sys.stderr.write("写出 %d 条到 %s\n" % (n, args.output))
-    else:
-        n = convert_mod.convert(records, sys.stdout, template, srcs)
-        sys.stderr.write("写出 %d 条\n" % n)
+    excluded_flags = 0
+    if args.exclude_instr:
+        excluded_flags |= FLAG_INSTR
+    if args.exclude_prefetch:
+        excluded_flags |= FLAG_PREFETCH
+    if args.exclude_dma:
+        excluded_flags |= FLAG_DMA
+
+    is_memsim = selected_preset == "memsim"
+    if is_memsim and args.ticks_per_cycle is None:
+        sys.stderr.write(
+            "hettrace convert: memsim 预设需要 --ticks-per-cycle，"
+            "用它把 HETTrace tick 显式换算成控制器 cycle\n"
+        )
+        return 1
+
+    map_path = args.map_output
+    if is_memsim and args.output and not args.no_map and not map_path:
+        map_path = args.output + ".map.csv"
+    if map_path and args.output:
+        if os.path.abspath(map_path) == os.path.abspath(args.output):
+            sys.stderr.write("hettrace convert: trace 与映射 sidecar 不能是同一个文件\n")
+            return 1
+
+    out_fh = sys.stdout
+    map_fh = None
+    try:
+        if args.output:
+            out_fh = open(args.output, "w")
+        if map_path:
+            map_fh = open(map_path, "w", newline="")
+        if is_memsim:
+            bus_widths = {}
+            for _path, header in entries:
+                if header.src_id in bus_widths:
+                    raise convert_mod.ConvertError(
+                        "src_id=%d 在多个 trace 文件中重复，"
+                        "无法确定 mem_sim 投影宽度" % header.src_id
+                    )
+                bus_widths[header.src_id] = header.axi_data_bytes
+            n = convert_mod.convert_memsim(
+                records,
+                out_fh,
+                args.ticks_per_cycle,
+                srcs,
+                map_fh=map_fh,
+                excluded_flags=excluded_flags,
+                allow_unmapped=args.allow_unmapped,
+                axi_data_bytes_by_src=bus_widths,
+            )
+        else:
+            n = convert_mod.convert(
+                records,
+                out_fh,
+                template,
+                srcs,
+                include_control=args.include_control,
+                ticks_per_cycle=args.ticks_per_cycle or 1,
+                excluded_flags=excluded_flags,
+            )
+    finally:
+        if map_fh is not None:
+            map_fh.close()
+        if args.output and out_fh is not sys.stdout:
+            out_fh.close()
+
+    destination = "到 %s" % args.output if args.output else ""
+    sys.stderr.write("写出 %d 条%s\n" % (n, destination))
+    if map_path:
+        sys.stderr.write("写出请求映射到 %s\n" % map_path)
     return 0
 
 
@@ -174,6 +268,10 @@ def build_parser():
 
     v = sub.add_parser("validate", help="校验 trace 是否可用于分析")
     v.add_argument("trace_dir")
+    v.add_argument(
+        "--allow-single-source", action="store_true",
+        help="独立设备 bring-up：仍做文件内全部检查，但不要求跨源交接",
+    )
     v.set_defaults(func=cmd_validate)
 
     m = sub.add_parser("merge", help="按全局 tick 归并多源 trace")
@@ -201,6 +299,29 @@ def build_parser():
     c.add_argument("--preset", default="readwrite")
     c.add_argument("--template", help="自定义格式串，覆盖 --preset")
     c.add_argument("--sources", help="只保留这些源，逗号分隔（名字或 id）")
+    c.add_argument(
+        "--ticks-per-cycle", type=_positive_int,
+        help="HETTrace tick 到目标 cycle 的整数除数；memsim 预设必须显式给出",
+    )
+    c.add_argument(
+        "--include-control", action="store_true",
+        help="自定义/通用预设也输出 AW/B/AR；默认只输出 W/R 数据通道",
+    )
+    c.add_argument("--exclude-instr", action="store_true")
+    c.add_argument("--exclude-prefetch", action="store_true")
+    c.add_argument("--exclude-dma", action="store_true")
+    c.add_argument(
+        "--allow-unmapped", action="store_true",
+        help="memsim 投影时允许 addrmap 未声明的地址（默认拒绝）",
+    )
+    c.add_argument(
+        "--map-output",
+        help="memsim host_request_id 到 AXI 记录的 CSV；默认 OUTPUT.map.csv",
+    )
+    c.add_argument(
+        "--no-map", action="store_true",
+        help="指定 -o 时不自动生成 memsim 映射 sidecar",
+    )
     c.add_argument("-o", "--output")
     c.add_argument("--list-presets", action="store_true")
     c.set_defaults(func=cmd_convert)
@@ -231,6 +352,9 @@ def main(argv=None):
             "         先跑 hettrace validate 看是哪个源出的问题。"
             "merge / convert 此前写出的内容是残缺的，不要使用。\n"
         )
+        return 1
+    except convert_mod.ConvertError as e:
+        sys.stderr.write("hettrace convert: %s\n" % e)
         return 1
     except BrokenPipeError:
         # `hettrace merge dir | head` 的正常收场。必须排在 OSError 之前 ——

@@ -9,12 +9,12 @@
 //   1. 喂 trace tap（本工程的目的）；
 //   2. 把数据路由到 gem5 内存或库内私有 DDR；
 //   3. 窗口外的访问按参考实现的语义落到 mailbox。
-// 回调本身**必须同步返回**：AXI 读要在同一拍给出 16 字节，没有等待的余地。
-// 这也是为什么 gem5 侧只能用 PortProxy 的 functional 访问，不能走 timing 端口 ——
-// 一旦要等响应，这里就没有能返回的东西。
+// wrapper 的异步 request/response seam 允许回调只发请求；gem5 DmaPort 完成后再
+// 调 complete_read/complete_write。没有 timing backend 时才走同步兼容路径。
 
 #include "coralnpu_gem5.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +67,13 @@ struct coralnpu_gem5_device_s {
     coralnpu_gem5_mem_write_t mem_write = nullptr;
     void*                     mem_ctx   = nullptr;
 
+    // Asynchronous timing backend. When installed, DDR requests leave the
+    // library immediately but AXI B/R is not produced until the gem5 side
+    // calls coralnpu_gem5_complete_* from its DMA completion event.
+    coralnpu_gem5_timing_read_t  timing_read  = nullptr;
+    coralnpu_gem5_timing_write_t timing_write = nullptr;
+    void*                        timing_ctx   = nullptr;
+
     uint8_t* ddr = nullptr;  // 私有 DDR，惰性 calloc
 
     // 越界的私有 DDR 访问次数。与 tap 的 burst 异常合并上报。
@@ -85,6 +92,9 @@ struct coralnpu_gem5_device_s {
     }
 
     bool has_backend() const { return mem_read != nullptr && mem_write != nullptr; }
+    bool has_timing_backend() const {
+        return timing_read != nullptr && timing_write != nullptr;
+    }
 
     // 私有 DDR，惰性分配。返回 nullptr 表示越界（已记 anomaly）。
     uint8_t* ddr_ptr(uint32_t dev_addr, uint32_t size) {
@@ -177,6 +187,33 @@ AxiWResp WriteCallback(Device* d, const AxiAddr& addr, const AxiWData& data) {
     return resp;
 }
 
+void AsyncReadCallback(Device* d, const AxiAddr& addr) {
+    if (!IsDdr(addr.addr_bits_addr) || !d->has_timing_backend()) {
+        d->wrapper.CompleteRead(ReadCallback(d, addr));
+        return;
+    }
+
+    if (d->tap != nullptr) d->tap->OnRead(addr);
+    const uint32_t aligned = addr.addr_bits_addr & ~(uint32_t)15;
+    d->timing_read(d->timing_ctx, aligned, addr.addr_bits_id,
+                   coralnpu_gem5::kAxiBeatBytes);
+}
+
+void AsyncWriteCallback(Device* d, const AxiAddr& addr, const AxiWData& data) {
+    if (!IsDdr(addr.addr_bits_addr) || !d->has_timing_backend()) {
+        d->wrapper.CompleteWrite(WriteCallback(d, addr, data));
+        return;
+    }
+
+    if (d->tap != nullptr) d->tap->OnWrite(addr, data);
+    const uint32_t aligned = addr.addr_bits_addr & ~(uint32_t)15;
+    const uint8_t* src =
+        reinterpret_cast<const uint8_t*>(&data.write_data_bits_data[0]);
+    d->timing_write(d->timing_ctx, aligned, addr.addr_bits_id, src,
+                    data.write_data_bits_strb,
+                    coralnpu_gem5::kAxiBeatBytes);
+}
+
 }  // namespace
 
 // ---- C ABI -----------------------------------------------------------------
@@ -195,11 +232,11 @@ coralnpu_gem5_handle_t coralnpu_gem5_create(void) {
     Device* d = new (std::nothrow) Device();
     if (d == nullptr) return nullptr;
 
-    d->wrapper.RegisterReadCallback(
-        [d](const AxiAddr& a) { return ReadCallback(d, a); });
-    d->wrapper.RegisterWriteCallback(
+    d->wrapper.RegisterAsyncReadCallback(
+        [d](const AxiAddr& a) { AsyncReadCallback(d, a); });
+    d->wrapper.RegisterAsyncWriteCallback(
         [d](const AxiAddr& a, const AxiWData& w) {
-            return WriteCallback(d, a, w);
+            AsyncWriteCallback(d, a, w);
         });
 
     d->wrapper.Reset();
@@ -220,6 +257,41 @@ void coralnpu_gem5_set_mem_backend(coralnpu_gem5_handle_t h,
     h->mem_read  = read_fn;
     h->mem_write = write_fn;
     h->mem_ctx   = ctx;
+}
+
+void coralnpu_gem5_set_timing_backend(
+    coralnpu_gem5_handle_t h,
+    coralnpu_gem5_timing_read_t read_fn,
+    coralnpu_gem5_timing_write_t write_fn,
+    void* ctx) {
+    if (h == nullptr) return;
+    h->timing_read  = read_fn;
+    h->timing_write = write_fn;
+    h->timing_ctx   = ctx;
+}
+
+void coralnpu_gem5_complete_read(coralnpu_gem5_handle_t h, uint8_t axi_id,
+                                 const uint8_t* src, uint32_t size,
+                                 uint8_t resp) {
+    if (h == nullptr || src == nullptr) return;
+    AxiRData out{};
+    uint8_t* dst = reinterpret_cast<uint8_t*>(&out.read_data_bits_data[0]);
+    const uint32_t copy_size =
+        std::min(size, coralnpu_gem5::kAxiBeatBytes);
+    std::memcpy(dst, src, copy_size);
+    out.read_data_bits_id   = axi_id;
+    out.read_data_bits_resp = resp;
+    out.read_data_bits_last = 1;
+    h->wrapper.CompleteRead(out);
+}
+
+void coralnpu_gem5_complete_write(coralnpu_gem5_handle_t h, uint8_t axi_id,
+                                  uint8_t resp) {
+    if (h == nullptr) return;
+    AxiWResp out{};
+    out.write_resp_bits_id   = axi_id;
+    out.write_resp_bits_resp = resp;
+    h->wrapper.CompleteWrite(out);
 }
 
 void coralnpu_gem5_ddr_write(coralnpu_gem5_handle_t h, uint64_t addr,

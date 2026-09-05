@@ -9,7 +9,7 @@
 #
 # 与 coralnpuint/tests/run_smoke.sh 的分工：那个在纯 C 里验设备库（时钟由测试
 # 程序推、内存后端是测试程序里的数组），这个验的是真 gem5（时钟是事件队列、
-# 内存后端是 physProxy、时间戳是 curTick()）。两个都过才说明整条链没问题。
+# 内存后端是 gem5 timing DmaPort、时间戳是 curTick()）。两个都过才说明整条链没问题。
 #
 # 三步，第三步是重点：
 #   1. 正向跑一遍，看内核跑完、trace 落盘。
@@ -67,10 +67,14 @@ echo "  ok   gem5 正常退出，trace 与侧车文件都在"
 echo
 echo "---- 2/3 hettrace validate ----"
 export PYTHONPATH="$PROJ_DIR/tools${PYTHONPATH:+:$PYTHONPATH}"
-# 只有一个源，validate 必然报那条"这不是异构 trace"的 ERROR 并返回非 0；
-# 这里只关心别的问题，所以取报告文本自己判。
-REPORT=$(python3 -m hettrace validate "$OUT" 2>&1 || true)
+# 独立设备 bring-up 显式允许单源；文件内格式、时钟、地址、序号和 AXI 因果
+# 仍按正式规则检查，只跳过跨源交接要求。
+set +e
+REPORT=$(python3 -m hettrace validate "$OUT" --allow-single-source 2>&1)
+VRC=$?
+set -e
 echo "$REPORT" | sed -n '/每源统计/,/结论/p'
+[ "$VRC" = "0" ] || fail "单源 validate 报了 ERROR"
 
 # 侧车文件里的计数器是权威来源，比在报告文本里 grep 关键词可靠 —— 报告的措辞
 # 会变，而且"报告里没提 non_monotonic"和"non_monotonic 为 0"是两件事。

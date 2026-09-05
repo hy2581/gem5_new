@@ -6,12 +6,11 @@
 # 做两件事：
 #   1. 新建一个独立 package $CORALNPU_HOME/gem5int/，把 ABI 实现、tap 和
 #      libhettrace 的头全部放进去。独立目录不会与上游冲突。
-#   2. 打两个补丁，都在 hw_sim/ 下，都是纯增量：
-#        core_mini_axi_wrapper.h  加 halted()/wfi() 两个非阻塞访问器。这是全
-#                                 工程唯一真正侵入 CoralNPU 逻辑的修改 —— 它
-#                                 存在只是因为那两个状态位是 private，而现成
-#                                 的 WaitForTermination() 会自己推时钟，在
-#                                 gem5 里不能用（见补丁里的注释）。
+#   2. 对三个 hw_sim 文件应用四个纯增量补丁：
+#        core_mini_axi_wrapper.h  加 halted()/wfi() 非阻塞访问器和异步 AXI
+#                                 request/response seam；
+#        hw_primitives.h          让 AXI B/R 响应可以由后续 gem5 timing 事件
+#                                 注入，RTL 会在真实 READY/VALID 上停等；
 #        BUILD                    把 core_mini_axi_wrapper 的 visibility 放到
 #                                 public，否则 //gem5int 依赖不到它。
 #
@@ -31,8 +30,11 @@ GEM5INT_DIR="$CORALNPU_HOME/gem5int"
 HW_SIM_DIR="$CORALNPU_HOME/hw_sim"
 
 # "被打补丁的文件名:补丁文件名"。补丁都是 -p0 且只作用于单个文件。
-PATCH_SPECS="core_mini_axi_wrapper.h:core_mini_axi_wrapper.h.patch
+PATCH_SPECS="hw_primitives.h:hw_primitives_async_axi.patch
 BUILD:hw_sim_BUILD.patch"
+CORE_FILE="core_mini_axi_wrapper.h"
+CORE_BASE_PATCH="core_mini_axi_wrapper.h.patch"
+CORE_ASYNC_PATCH="core_mini_axi_wrapper_async.patch"
 
 if [ ! -f "$HW_SIM_DIR/core_mini_axi_wrapper.h" ]; then
     echo "错误: CORALNPU_HOME=$CORALNPU_HOME 看起来不是 CoralNPU 源码树" >&2
@@ -67,8 +69,29 @@ revert_patch() {
     fi
 }
 
+# 两个 core wrapper 补丁必须视为一个有顺序的 patch stack。async 补丁建立在
+# base 补丁之上，会改变 base hunk 后面的上下文；若逐个做 base 的 reverse
+# dry-run，patch 可能误判成“尚未安装”并把同一段代码再次插入。
+apply_core_patch_stack() {
+    local async="$SELF_DIR/patches/$CORE_ASYNC_PATCH"
+    if patch -R -p0 -s -f --dry-run -i "$async" \
+            "$HW_SIM_DIR/$CORE_FILE" >/dev/null 2>&1; then
+        echo "  hw_sim/$CORE_FILE: base + async 补丁已在，跳过"
+        return 0
+    fi
+    apply_patch "$CORE_FILE" "$CORE_BASE_PATCH"
+    apply_patch "$CORE_FILE" "$CORE_ASYNC_PATCH"
+}
+
+revert_core_patch_stack() {
+    # 严格逆序；async 去掉后 base 的原始上下文才恢复。
+    revert_patch "$CORE_FILE" "$CORE_ASYNC_PATCH"
+    revert_patch "$CORE_FILE" "$CORE_BASE_PATCH"
+}
+
 if [ "$REVERT" = "1" ]; then
     echo "还原 CoralNPU gem5 集成:"
+    revert_core_patch_stack
     for spec in $PATCH_SPECS; do
         revert_patch "${spec%%:*}" "${spec##*:}"
     done
@@ -93,9 +116,21 @@ install -m 0644 "$SELF_DIR/coralnpu_gem5.map" "$GEM5INT_DIR/"
 install -m 0644 "$SELF_DIR/BUILD.bazel"      "$GEM5INT_DIR/BUILD"
 echo "  gem5int/ -> $GEM5INT_DIR"
 
+apply_core_patch_stack
 for spec in $PATCH_SPECS; do
     apply_patch "${spec%%:*}" "${spec##*:}"
 done
+
+# 把补丁栈幂等性变成安装时不变量，避免重复方法一直拖到 C++ 编译才暴露。
+HALTED_COUNT=$(grep -c 'bool halted() const' "$HW_SIM_DIR/$CORE_FILE" || true)
+ASYNC_READ_COUNT=$(grep -c 'void RegisterAsyncReadCallback' \
+    "$HW_SIM_DIR/$CORE_FILE" || true)
+if [ "$HALTED_COUNT" -ne 1 ] || [ "$ASYNC_READ_COUNT" -ne 1 ]; then
+    echo "错误: hw_sim/$CORE_FILE 补丁栈重复或缺失" >&2
+    echo "      halted=$HALTED_COUNT async_read=$ASYNC_READ_COUNT（都应为 1）" >&2
+    exit 1
+fi
+echo "  core patch stack: halted=1 async_read=1（幂等性检查通过）"
 
 cat <<EOF
 
@@ -109,5 +144,5 @@ cat <<EOF
 
 2) gem5 侧：
      GEM5_HOME=\$GEM5_HOME $PROJ_DIR/gem5int/install.sh
-     scons -C \$GEM5_HOME build/X86/gem5.opt -j\$(nproc)
+     cd \$GEM5_HOME && .venv/bin/scons build/X86/gem5.opt -j\$(nproc)
 EOF

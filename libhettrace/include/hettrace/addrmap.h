@@ -30,6 +30,7 @@ enum TapLevel : uint8_t {
     kLevelPostLlc = 0,
     kLevelPreCache = 1,
     kLevelAxiMaster = 2,
+    kLevelInterconnect = 3,
 };
 
 // 各源标称时钟（用于把源内 cycle 折算成全局 tick）

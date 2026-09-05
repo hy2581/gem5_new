@@ -10,12 +10,12 @@
 # "找不到 .so"，看不出是被系统删的。
 #
 # 前提：
-#   1. vortexint/install.sh 跑过（5 个补丁打进 Vortex 树）；
+#   1. vortexint/install.sh 跑过（观测补丁和 timing-feedback 组合补丁在位）；
 #   2. $VORTEX_HOME/sim/simx/gem5/install.sh 跑过且 gem5.opt 编过（Vortex 的
 #      gem5 SimObject 源码 source-of-truth 在 Vortex 树里，不在本项目）；
 #   3. Vortex 的 third_party 建过，且 libvortex-gem5.so 用 USE_GEM5=1 编过：
 #        make -C $VORTEX_HOME/third_party
-#        make -C $VORTEX_BUILD/sim/simx USE_GEM5=1 libvortex-gem5
+#        env -u DEBUG make -C $VORTEX_BUILD/sim/simx USE_GEM5=1 libvortex-gem5
 #
 # ---- 这个测试验什么、不验什么 ----
 #
@@ -43,7 +43,7 @@ fail() { echo "错误: $*" >&2; exit 1; }
 [ -x "$GEM5_BIN" ] || fail "找不到 $GEM5_BIN，先 scons build/X86/gem5.opt"
 [ -f "$CONFIG" ]   || fail "找不到 $CONFIG，先跑 gem5int/install.sh"
 [ -f "$SO" ] || fail "找不到 $SO
-      先 make -C $VORTEX_BUILD/sim/simx USE_GEM5=1 libvortex-gem5
+      先 env -u DEBUG make -C $VORTEX_BUILD/sim/simx USE_GEM5=1 libvortex-gem5
       （USE_GEM5=1 不能省 —— 默认只编 simx 可执行文件，不编这个库）"
 
 # gem5 里有没有 VortexGPGPU 这个 SimObject，比"库在不在"更容易漏检查：库是
@@ -53,7 +53,7 @@ grep -q trace_enable "$GEM5_HOME/build/X86/params/VortexGPGPU.hh" 2>/dev/null ||
       说明 gem5 是用打补丁前的 VortexGPGPU.py 编的。依次跑：
         VORTEX_HOME=$VORTEX_HOME $PROJ_DIR/vortexint/install.sh
         GEM5_HOME=$GEM5_HOME $VORTEX_HOME/sim/simx/gem5/install.sh
-        scons -C $GEM5_HOME build/X86/gem5.opt -j\$(nproc)"
+        cd $GEM5_HOME && .venv/bin/scons build/X86/gem5.opt -j\$(nproc)"
 
 # 内核每次都重建。它只有 88 字节，重建的代价可以忽略，而"改了 kernel.S 忘了
 # make"会表现成记录数莫名变化，很难查。
@@ -127,12 +127,11 @@ sys.exit(1 if bad else 0)
 PY
 
 # ---- 3. 区域分布 -----------------------------------------------------------
-# 这一步不调 validate：单源 trace 在 validate 眼里是 ERROR（"这不是异构
-# trace"），那个判断对 run_het.sh 是对的，对这里是噪声。所以只看 dump 出来的
-# 区域列，直接检查该落的地方落到了。
+# 显式单源模式仍会做全部文件内检查，只跳过跨源交接要求。
 echo
 echo "---- 3/3 记录落在 vortex_vram ----"
 export PYTHONPATH="$PROJ_DIR/tools${PYTHONPATH:+:$PYTHONPATH}"
+python3 -m hettrace validate "$OUT" --allow-single-source
 python3 -m hettrace dump "$OUT/vortex.hettrace" -n 0 > "$OUT/dump.txt"
 python3 - "$OUT/dump.txt" <<'PY' || exit 1
 import sys

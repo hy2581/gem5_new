@@ -27,10 +27,9 @@
 // 用自己的一块私有数组当 DDR（和参考实现 core_mini_axi_simulator.cc 一样），
 // 这时"共享 buffer"只是地址上共享，数据并不真的共享。
 //
-// coralnpu_gem5_set_mem_backend() 可以把这两个回调接到 gem5 的内存系统上，
-// 于是 NPU 读到的就是 host CPU 真写进去的字节 —— 真共享。gem5 侧用
-// PortProxy 的 functional 访问实现，不消耗仿真时间，与本工程"只观测、不做时序
-// 耦合"的定位一致。
+// standalone 测试可用同步 set_mem_backend()。gem5 的生产路径使用下面的
+// set_timing_backend()：请求先返回，等 timing memory 完成后再注入 AXI R/B，
+// 因而下游排队与延迟会反压 NPU。
 //
 // ---- 并发 ----
 //
@@ -69,9 +68,8 @@ void coralnpu_gem5_destroy(coralnpu_gem5_handle_t h);
 
 // ---- 内存后端 --------------------------------------------------------------
 
-// 把 AXI master 的读写接到外部内存上。两个回调都必须是**同步**的：AXI 读回调
-// 要在同一拍内返回数据，没有等待的余地。gem5 侧用 PortProxy 的 functional
-// 访问满足这一点。
+// 把 AXI master 的读写接到同步外部内存，供 standalone/兼容测试使用。gem5
+// timing 模式不要使用这个接口，应使用下面的事件驱动接口。
 //
 // 传 NULL 恢复为库内私有 DDR 数组。
 typedef void (*coralnpu_gem5_mem_read_t)(void* ctx, uint64_t addr,
@@ -82,6 +80,29 @@ void coralnpu_gem5_set_mem_backend(coralnpu_gem5_handle_t h,
                                    coralnpu_gem5_mem_read_t read_fn,
                                    coralnpu_gem5_mem_write_t write_fn,
                                    void* ctx);
+
+// Event-driven timing backend.  Issue callbacks are invoked after a real AXI
+// address/data handshake and return without a response.  The simulator must
+// later call complete_read/complete_write; until then the RTL observes no
+// RVALID/BVALID and stalls naturally.  This is the production path for gem5
+// timing mode; the synchronous callbacks above remain for standalone use.
+typedef void (*coralnpu_gem5_timing_read_t)(void* ctx, uint64_t addr,
+                                            uint8_t axi_id, uint32_t size);
+typedef void (*coralnpu_gem5_timing_write_t)(void* ctx, uint64_t addr,
+                                             uint8_t axi_id,
+                                             const uint8_t* src,
+                                             uint16_t strb, uint32_t size);
+void coralnpu_gem5_set_timing_backend(
+    coralnpu_gem5_handle_t h,
+    coralnpu_gem5_timing_read_t read_fn,
+    coralnpu_gem5_timing_write_t write_fn,
+    void* ctx);
+
+void coralnpu_gem5_complete_read(coralnpu_gem5_handle_t h, uint8_t axi_id,
+                                 const uint8_t* src, uint32_t size,
+                                 uint8_t resp);
+void coralnpu_gem5_complete_write(coralnpu_gem5_handle_t h, uint8_t axi_id,
+                                  uint8_t resp);
 
 // 直接读写库内私有 DDR 数组，供未接后端时预置/回读数据。接了 gem5 后端后
 // 这两个函数就没有意义了（私有数组不再被使用），调用会被忽略。

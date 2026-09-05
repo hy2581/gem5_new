@@ -7,7 +7,8 @@
 //      TCM 里跑完，一次外部访存都没有，跑它们 tap 只会输出 0 条记录 —— 看着
 //      "通过"，其实什么都没测到。这个内核强制走外部 DDR。
 //   2. 异构协同负载里 NPU 那一段：host 写 in[]，NPU 读 in[] 算完写 out[]，
-//      host 再读回来核对。三方共用 addrmap.json 里的同一段物理地址。
+//      host 再读回来核对。host/NPU 共用 addrmap.json 里的这段
+//      物理地址；Vortex 与 host 的交接另走 4GiB 以上的 BAR。
 //
 // 地址全部取自 addrmap.json，那是整个工程的地址真值源，别在这里另起一套。
 //
