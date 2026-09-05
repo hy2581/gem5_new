@@ -140,19 +140,67 @@ def test_addrmap_invariants():
     check(not addrmap.is_traced(addrmap.REGIONS["vortex_cp"][0]),
           "CP 寄存器不是内存流量，不该进 trace")
 
-    check(addrmap.SHARED_REGIONS, "必须至少有一个三方共享区")
-    for name in addrmap.SHARED_REGIONS:
-        check(len(addrmap.REGIONS[name][3]) >= 3,
-              "共享区 %s 应有 ≥3 个 accessor" % name)
-
     shared_base = addrmap.REGIONS["shared_buffer"][0]
+    check(not any(len(region[3]) >= 3 for region in addrmap.REGIONS.values()),
+          "当前地址约束下不应声称存在三方直连共享区")
+    check(addrmap.REGIONS["shared_buffer"][3] == ("host", "coralnpu"),
+          "shared_buffer 应只属于 host↔CoralNPU 交接")
+    check(not addrmap.may_access("vortex", shared_base),
+          "Vortex 不应以同一物理地址访问 shared_buffer")
     check(addrmap.region_of(shared_base) == "shared_buffer", "region_of 应正确")
-    check(addrmap.is_shared(shared_base), "is_shared 应正确")
     check(addrmap.region_of(0xDEADBEEF) is None, "未映射地址应返回 None")
     check(not addrmap.may_access("coralnpu", addrmap.REGIONS["host_heap"][0]),
           "NPU 不应被允许访问 host 私有堆")
     check(addrmap.may_access("coralnpu", shared_base),
           "NPU 应被允许访问共享区")
+
+
+def test_docs_are_current():
+    """持久化文档不得链接缺失文件或复活已删除架构。"""
+    markdown = []
+    for directory, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in (".git", "build", "__pycache__")
+        ]
+        markdown.extend(
+            os.path.join(directory, name)
+            for name in filenames if name.endswith(".md")
+        )
+
+    broken = []
+    obsolete = []
+    forbidden = (
+        "HetTraceProbe",
+        "05-beginner-report.md",
+        "architecture-overview.png",
+        "current-architecture-dataflow.png",
+        "heterogeneous-trace-beginner-guide.pdf",
+    )
+    link_pattern = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+    for path in markdown:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        for marker in forbidden:
+            if marker in text:
+                obsolete.append("%s:%s" % (os.path.relpath(path, ROOT), marker))
+        for raw_target in link_pattern.findall(text):
+            target = raw_target.strip().split()[0].strip("<>")
+            if target.startswith(("http://", "https://", "mailto:", "#")):
+                continue
+            relative = target.split("#", 1)[0]
+            resolved = os.path.join(os.path.dirname(path), relative)
+            if relative and not os.path.exists(resolved):
+                broken.append("%s:%s" % (os.path.relpath(path, ROOT), target))
+
+    check(not broken, "Markdown 相对链接必须存在，失效: %r" % broken)
+    check(not obsolete, "文档不得引用已删除内容: %r" % obsolete)
+    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+        readme = handle.read()
+    with open(os.path.join(ROOT, "docs", "USER_MANUAL.md"), encoding="utf-8") as handle:
+        manual = handle.read()
+    check("05-validation-report.md" in readme and "05-validation-report.md" in manual,
+          "README 与项目手册都必须指向当前验证报告")
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +415,9 @@ def test_validate_accepts_healthy():
         check(len(summaries) == 3, "应汇总 3 个源")
         infos = [i for i in issues if i.level == "INFO"]
         check(any("shared_buffer" in i.message for i in infos),
-              "应报告共享区被三方访问")
+              "应报告 host↔NPU shared_buffer 交接")
+        check(any("vortex_bar" in i.message for i in infos),
+              "应报告 host↔Vortex BAR 交接")
         # 报告应能生成且不抛异常
         rep = validate.format_report(issues, summaries)
         check("结论" in rep, "报告应含结论行")
@@ -379,8 +429,8 @@ def test_validate_accepts_healthy():
 def test_validate_accepts_bar_pair():
     """host + Vortex 经 BAR 交接、完全不碰 shared_buffer —— 必须放行。
 
-    这条盯的是一个具体的回归：交接区按源的配对而不同，validate 若只认三方共享区
-    就会把这种合法跑法判成"无信息量"。
+    这条盯的是一个具体的回归：交接区按源的配对而不同，validate 不能要求
+    三方在同一物理地址上共享，否则会把这种合法跑法判成"无信息量"。
     """
     d = tmpdir()
     try:
@@ -573,12 +623,12 @@ def test_validate_rejects_mixed_capture_levels():
     """逐源 level 都合法，也不能把 interconnect 与设备 tap 混为一批。"""
     d = tmpdir()
     try:
-        shared = addrmap.REGIONS["shared_buffer"][0]
+        bar = addrmap.REGIONS["vortex_bar"][0]
         host = synth.SynthWriter(d, "host", level="interconnect")
         vortex = synth.SynthWriter(d, "vortex", level="post_llc")
         for i in range(2):
-            host.emit(1000 + i * 100, shared + i * 64, 64, OP_WRITE)
-            vortex.emit(1050 + i * 100, shared + i * 64, 64, OP_READ)
+            host.emit(1000 + i * 100, bar + i * 64, 64, OP_WRITE)
+            vortex.emit(1050 + i * 100, bar + i * 64, 64, OP_READ)
         host.close()
         vortex.close()
 
@@ -806,7 +856,7 @@ def test_stats_detects_sharing():
         sizes, pairwise, lb = stats.footprint(d)
         check(len(sizes) == 3, "footprint 应覆盖 3 个源")
         check(lb == 64, "默认 line 应为 64 字节")
-        # host 与 vortex 都访问共享 buffer 的同一批 line
+        # host 与 Vortex 经 BAR、host 与 NPU 经 shared_buffer 共享 line
         check(pairwise.get(("host", "vortex"), 0) > 0,
               "host 与 vortex 应有共享 line，实为 %r" % pairwise)
         check(pairwise.get(("coralnpu", "host"), 0) > 0
@@ -1276,7 +1326,7 @@ def test_cpp_writer_interop():
             return
 
         hdr = read_header(p)
-        shared = addrmap.REGIONS["shared_buffer"][0]
+        bar = addrmap.REGIONS["vortex_bar"][0]
         vram = addrmap.REGIONS["vortex_vram"][0]
         check(hdr.name == "vortex", "Python 应读出源名 vortex，实为 %r" % hdr.name)
         check(hdr.src_id == addrmap.SOURCES["vortex"][0], "src_id 应一致")
@@ -1287,12 +1337,12 @@ def test_cpp_writer_interop():
         recs = list(read_records(p))
         check(len(recs) == 3, "应读出 3 条，实为 %d" % len(recs))
         if len(recs) == 3:
-            check(recs[0].tick == 1000 and recs[0].addr == shared
+            check(recs[0].tick == 1000 and recs[0].addr == bar
                   and recs[0].size == 64 and recs[0].op == OP_READ
                   and recs[0].ctx == 7 and recs[0].seq == 0,
                   "记录 0 应逐字段一致，实为 %r" % (recs[0],))
-            check(recs[1].op == OP_WRITE and recs[1].addr == shared + 64,
-                  "记录 1 应为写共享区下一行")
+            check(recs[1].op == OP_WRITE and recs[1].addr == bar + 64,
+                  "记录 1 应为写 BAR 下一行")
             check(recs[2].addr == vram, "记录 2 应为 VRAM 地址")
 
         # burst 展开的产物也要能读，且地址真的递增
@@ -1301,6 +1351,7 @@ def test_cpp_writer_interop():
             brecs = list(read_records(pb))
             check(len(brecs) == 4, "burst 应展开为 4 条")
             addrs = [r.addr for r in brecs]
+            shared = addrmap.REGIONS["shared_buffer"][0]
             check(addrs == [shared + i * 16 for i in range(4)],
                   "burst 地址应按拍递增，实为 %r" % [hex(a) for a in addrs])
     finally:

@@ -22,7 +22,8 @@ make test-memsim-smoke
 ```
 
 它固定使用 16 B 请求粒度；当前基线生成 596 个请求，并同时检查请求数、字节数、response ID
-和外部模型的 data mismatch。较大的默认实验为：
+和外部模型的 data mismatch。当前实测数字见
+[验证报告](../../docs/05-validation-report.md)。较大的默认实验为：
 
 ```bash
 make benchmark-llm-memory

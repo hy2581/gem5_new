@@ -235,34 +235,36 @@ class SynthWriter:
 
 
 def gen_cooperative(directory, n_per_src=200):
-    """健康形态：host 写共享 buffer -> Vortex 读改写 -> NPU 读结果。
+    """健康形态：host 分别经 shared buffer 与 BAR 向两个设备交接。
 
-    三者时间区间重叠，共享区被三方触及 —— 这是 validate 应当完全放行的形态，
-    也是 workloads/shared_buffer 那个负载要在真机上复现的访问模式。
+    三者时间区间重叠；host+NPU 共享 shared_buffer，host+Vortex 共享
+    vortex_bar。受地址宽度约束，不虚构 NPU 与 Vortex 的三方直连共享地址。
     """
     shared = addrmap.REGIONS["shared_buffer"][0]
+    bar = addrmap.REGIONS["vortex_bar"][0]
     period = {n: addrmap.SOURCES[n][3] for n in ("host", "vortex", "coralnpu")}
 
-    # host：填充共享 buffer，并在全程持续访问自己的堆
+    # host：分别填充 NPU shared buffer 与 Vortex BAR
     h = SynthWriter(
         directory, "host", level="interconnect", synth_flag=True
     )
     for i in range(n_per_src):
         h.emit(1000 + i * 10 * period["host"], shared + i * 64, 64, OP_WRITE, ctx=0)
         h.emit(1000 + (i * 10 + 5) * period["host"],
-               addrmap.REGIONS["host_heap"][0] + i * 64, 64, OP_READ, ctx=0)
+               bar + 0x10000 + i * 64, 64, OP_WRITE, ctx=0)
     h.close()
 
-    # vortex：读共享 buffer 再写回，同时用自己的 VRAM
+    # vortex：经 BAR 读取 host 输入、访问 scratch，再写结果
     v = SynthWriter(
         directory, "vortex", level="interconnect", synth_flag=True
     )
     for i in range(n_per_src):
         base = 3000 + i * 12 * period["vortex"]
-        v.emit(base, shared + i * 64, 64, OP_READ, ctx=i % 8)
+        v.emit(base, bar + 0x10000 + i * 64, 64, OP_READ, ctx=i % 8)
         v.emit(base + 2 * period["vortex"],
-               addrmap.REGIONS["vortex_vram"][0] + i * 64, 64, OP_READ, ctx=i % 8)
-        v.emit(base + 4 * period["vortex"], shared + i * 64, 64, OP_WRITE, ctx=i % 8)
+               bar + 0x30000 + i * 64, 64, OP_READ, ctx=i % 8)
+        v.emit(base + 4 * period["vortex"],
+               bar + 0x20000 + i * 64, 64, OP_WRITE, ctx=i % 8)
     v.close()
 
     # npu：读共享 buffer 的结果，写自己的工作区
@@ -318,6 +320,8 @@ def gen_axi_full(directory, n=20):
     地址/ID/WSTRB，但五通道事件、时序和其余属性仍是 monitor 重构。
     """
     shared = addrmap.REGIONS["shared_buffer"][0]
+    bar = addrmap.REGIONS["vortex_bar"][0]
+    npu_work = addrmap.REGIONS["npu_work"][0]
 
     host = SynthWriter(
         directory, "host", level="interconnect", axi_data_bytes=16,
@@ -332,13 +336,17 @@ def gen_axi_full(directory, n=20):
     )
 
     for i in range(n):
-        addr = shared + i * 64
         base = 1000 + i * 2000
-        host.emit_txn(base, base + 300, addr, 64, OP_WRITE,
+        # 偶数轮验证 host↔NPU shared_buffer，奇数轮验证
+        # host↔Vortex BAR；每个源只访问其真实可达地址。
+        host_addr = (shared + i * 64) if i % 2 == 0 else (bar + i * 64)
+        vortex_addr = bar + i * 64
+        npu_addr = (shared + i * 64) if i % 2 == 0 else (npu_work + i * 64)
+        host.emit_txn(base, base + 300, host_addr, 64, OP_WRITE,
                       ctx=i % 4, axi_id=i % 16)
-        vortex.emit_txn(base + 100, base + 700, addr, 64, OP_READ,
+        vortex.emit_txn(base + 100, base + 700, vortex_addr, 64, OP_READ,
                         ctx=i % 8, axi_id=(i + 3) % 16)
-        npu.emit_txn(base + 200, base + 600, addr, 16, OP_READ,
+        npu.emit_txn(base + 200, base + 600, npu_addr, 16, OP_READ,
                      ctx=i % 4, axi_id=i % 4)
 
     host.close()
@@ -349,13 +357,13 @@ def gen_axi_full(directory, n=20):
 
 def gen_broken_axi_orphan(directory):
     """失效形态：有地址通道，但一条 R 的 txn 找不到对应 AR。"""
-    shared = addrmap.REGIONS["shared_buffer"][0]
+    handoff = addrmap.REGIONS["vortex_bar"][0]
 
     host = SynthWriter(
         directory, "host", level="interconnect", axi_data_bytes=16,
         synth_flag=True
     )
-    host.emit_txn(1000, 1300, shared, 16, OP_WRITE, axi_id=1)
+    host.emit_txn(1000, 1300, handoff, 16, OP_WRITE, axi_id=1)
     host.close()
 
     vortex = SynthWriter(
@@ -363,11 +371,11 @@ def gen_broken_axi_orphan(directory):
         synth_flag=True
     )
     open_txn = vortex.emit_txn(
-        1100, 0, shared, 16, OP_READ, axi_id=2, complete=False
+        1100, 0, handoff, 16, OP_READ, axi_id=2, complete=False
     )
     # 故意用另一个 txn 写回 R；原 AR 因而保持 open，这条 R 则成为 orphan。
     vortex._push(
-        1200, shared, 0, 16, 0, open_txn + 99, 2, OP_READ, CHAN_R,
+        1200, handoff, 0, 16, 0, open_txn + 99, 2, OP_READ, CHAN_R,
         0, 4, 0, FLAG_LAST,
     )
     vortex.close()
@@ -388,10 +396,10 @@ def gen_broken_no_sharing(directory, n=100):
 
 def gen_broken_non_monotonic(directory, n=50):
     """失效形态：Vortex 的时间戳用了源内 cycle 而非全局 tick，出现回退。"""
-    shared = addrmap.REGIONS["shared_buffer"][0]
+    bar = addrmap.REGIONS["vortex_bar"][0]
     h = SynthWriter(directory, "host")
     for i in range(n):
-        h.emit(1000 + i * 100, shared + i * 64, 64, OP_WRITE)
+        h.emit(1000 + i * 100, bar + i * 64, 64, OP_WRITE)
     h.close()
 
     v = SynthWriter(directory, "vortex")
@@ -399,7 +407,7 @@ def gen_broken_non_monotonic(directory, n=50):
         tick = 1000 + i * 100
         if i == n // 2:
             tick = 500          # 回退
-        v.emit(tick, shared + i * 64, 64, OP_READ)
+        v.emit(tick, bar + i * 64, 64, OP_READ)
     v.close()
     return directory
 
@@ -407,11 +415,16 @@ def gen_broken_non_monotonic(directory, n=50):
 def gen_broken_serial(directory, n=50):
     """失效形态：三者串行执行，时间区间不重叠 —— 无争抢可分析，应报 WARN。"""
     shared = addrmap.REGIONS["shared_buffer"][0]
+    bar = addrmap.REGIONS["vortex_bar"][0]
     for idx, name in enumerate(("host", "vortex", "coralnpu")):
         w = SynthWriter(directory, name)
         t0 = 1000 + idx * 10 ** 7
         for i in range(n):
-            w.emit(t0 + i * 100, shared + i * 64, 64,
+            address = (shared if name == "coralnpu" else bar) + i * 64
+            # host 需同时与两个设备形成真实交接，故交替触及两块窗口。
+            if name == "host" and i % 2 == 0:
+                address = shared + i * 64
+            w.emit(t0 + i * 100, address, 64,
                    OP_WRITE if idx == 0 else OP_READ)
         w.close()
     return directory
@@ -419,31 +432,31 @@ def gen_broken_serial(directory, n=50):
 
 def gen_broken_truncated(directory, n=50):
     """失效形态：meta 说 n 条，文件里只有 n-10 条 —— 进程被杀，缓冲丢了。"""
-    shared = addrmap.REGIONS["shared_buffer"][0]
+    bar = addrmap.REGIONS["vortex_bar"][0]
     h = SynthWriter(directory, "host")
     for i in range(n):
-        h.emit(1000 + i * 100, shared + i * 64, 64, OP_WRITE)
+        h.emit(1000 + i * 100, bar + i * 64, 64, OP_WRITE)
     h.close()
 
     v = SynthWriter(directory, "vortex")
     for i in range(n):
-        v.emit(1000 + i * 100, shared + i * 64, 64, OP_READ)
+        v.emit(1000 + i * 100, bar + i * 64, 64, OP_READ)
     v.close(truncate_records=10)
     return directory
 
 
 def gen_broken_seq_gap(directory, n=50):
     """失效形态：seq 有洞 —— 记录在中途被丢弃。"""
-    shared = addrmap.REGIONS["shared_buffer"][0]
+    bar = addrmap.REGIONS["vortex_bar"][0]
     h = SynthWriter(directory, "host")
     for i in range(n):
-        h.emit(1000 + i * 100, shared + i * 64, 64, OP_WRITE)
+        h.emit(1000 + i * 100, bar + i * 64, 64, OP_WRITE)
     h.close()
 
     v = SynthWriter(directory, "vortex")
     for i in range(n):
         seq = i if i < n // 2 else i + 7   # 断裂
-        v.emit(1000 + i * 100, shared + i * 64, 64, OP_READ, seq=seq)
+        v.emit(1000 + i * 100, bar + i * 64, 64, OP_READ, seq=seq)
     v.close()
     return directory
 

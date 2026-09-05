@@ -55,10 +55,9 @@ make benchmark-llm-memory
 `mem_sim` 投影守恒。`test-memsim-smoke` 会快速把小型 LLM-like trace 真正送入外部 `hbm_sim`
 并按 sidecar 对齐所有 response；`benchmark-llm-memory` 保留较大的默认实验规模，运行更久。
 
-2026-09-05 的 16 B 粒度快速回归由真实外部 `hbm_sim` 完成 596/596 个请求，response ID
-与 mapping 全部对齐；最终三源功能 trace 也由真实外部 `hbm_sim` 完成 50,487/50,487 个请求，
-mapping/response ID 全部对齐且 731,880 B 守恒。零值粒度替身的 `data_mismatches=0` 或
-`uninitialized_data` 状态都不代表原 AXI 数据正确；这些数字只用于守恒回归，不代表产品性能。
+最新回归的逐项数字、执行日期和模型口径统一记录在
+[当前版本验证报告](docs/05-validation-report.md)。快速与完整三源 trace 都已实际送入外部
+`hbm_sim` 并完成请求、字节、mapping 与 response 守恒检查；这些结果不代表产品性能。
 
 ## 目录
 
@@ -80,5 +79,6 @@ mapping/response ID 全部对齐且 731,880 B 守恒。零值粒度替身的 `da
 - [HETTrace v2 格式](docs/02-trace-format.md)：字段、层级和投影；
 - [结论边界](docs/03-limitations.md)：open-loop 能与不能说明什么；
 - [上游集成](docs/04-integration.md)：安装内容和补丁维护；
+- [验证报告](docs/05-validation-report.md)：当前版本的测试矩阵、三源 trace 与 HBM 重放结果；
 - [RTL AXI 边界](docs/06-storage-chain-plan.md)：参考模块与限制；
 - [固定上游版本](UPSTREAM.md)：已验证的外部源码 commit 与工具版本。

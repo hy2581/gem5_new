@@ -62,7 +62,7 @@ constexpr uint64_t kNpuPioSize = 0x1000ull;
 constexpr uint64_t kHostHeapBase = 0x80000000ull;
 constexpr uint64_t kHostHeapSize = 0x10000000ull;
 
-// shared_buffer: 三方交接区。异构 trace 的全部信息量来自这里 —— 归并工具据此判定真实共享。
+// shared_buffer: host 与 CoralNPU 的显式交接区。Vortex 的设备地址会加上 4 GiB pin base 后落入 vortex_bar，不能以同一物理地址访问这里。
 constexpr uint64_t kSharedBufferBase = 0x90000000ull;
 constexpr uint64_t kSharedBufferSize = 0x10000000ull;
 
@@ -149,11 +149,6 @@ inline bool IsTraced(uint64_t addr) {
         }
     }
     return false;
-}
-
-inline bool IsShared(uint64_t addr) {
-    return addr >= kSharedBufferBase &&
-           addr <  kSharedBufferBase + kSharedBufferSize;
 }
 
 }  // namespace hettrace

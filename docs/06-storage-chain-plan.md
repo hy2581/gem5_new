@@ -13,7 +13,7 @@ xpu_axi_master ──AW/W/B/AR/R──> storage_chain_top ──> testbench memo
 运行：
 
 ```bash
-make -C storage_chain test
+make -C storage_chain test lint
 ```
 
 测试覆盖三个 `AxUSER` 来源、六笔读写事务、全写/部分 WSTRB、ID、RESP、LAST、地址/数据通道

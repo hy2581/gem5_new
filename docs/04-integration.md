@@ -47,7 +47,7 @@ cmake --build "$MEMSIM_BUILD" -j"$(nproc)"
 
 `gem5int/install.sh` 镜像以下目录：
 
-- `src/hettrace/`：透明 request/response monitor 和兼容的诊断 probe；
+- `src/hettrace/`：透明 request/response monitor 及其 SimObject 构建声明；
 - `src/dev/coralnpu/`：CoralNPU SimObject；
 - `src/mem/unified_timing/`：稀疏功能 responder；
 - `configs/het/`：独立与异构配置。
@@ -108,4 +108,4 @@ export LD_LIBRARY_PATH="$VORTEX_HOME/third_party/ramulator${LD_LIBRARY_PATH:+:$L
 
 若 gem5 启动时不认识新参数，重新运行对应安装器并重编 gem5，不要只复制 Python 配置。若
 `HETTRACE_DIR` 没有 trace，先看 monitor 的 close 统计和 source requestor 分类，再检查地址图；
-不要启用旧 per-device tap 来掩盖统一观察点的问题。
+不要启用 per-device 诊断 tap 来掩盖统一观察点的问题。

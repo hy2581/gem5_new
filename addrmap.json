@@ -74,8 +74,8 @@
       "base": "0x90000000",
       "size": "0x10000000",
       "kind": "dram",
-      "accessors": ["host", "vortex", "coralnpu"],
-      "note": "三方交接区。异构 trace 的全部信息量来自这里 —— 归并工具据此判定真实共享。"
+      "accessors": ["host", "coralnpu"],
+      "note": "host 与 CoralNPU 的显式交接区。Vortex 的设备地址会加上 4 GiB pin base 后落入 vortex_bar，不能以同一物理地址访问这里。"
     },
     {
       "name": "vortex_vram",

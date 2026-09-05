@@ -128,9 +128,8 @@ def validate(m):
                 % (r["name"], dw_lo, dw_hi)
             )
 
-    shared = [r for r in m["regions"] if len(r["accessors"]) >= 3]
-    if not shared:
-        errs.append("没有任何 region 被三方共同访问 —— 异构 trace 将无信息量")
+    if not any(len(r["accessors"]) >= 2 for r in m["regions"]):
+        errs.append("没有任何 region 可供两个源交接 —— 异构 trace 将无协同信息")
 
     known = set(r["name"] for r in m["regions"]) | {"dram_window"}
     for name in m["trace_windows"]["regions"]:
@@ -265,11 +264,6 @@ def gen_h(m):
     a("    return false;")
     a("}")
     a("")
-    a("inline bool IsShared(uint64_t addr) {")
-    a("    return addr >= kSharedBufferBase &&")
-    a("           addr <  kSharedBufferBase + kSharedBufferSize;")
-    a("}")
-    a("")
     a("}  // namespace hettrace")
     a("")
     a("#endif  // HETTRACE_ADDRMAP_H_")
@@ -332,16 +326,12 @@ def gen_py(m):
         a('    ("%s", 0x%X, 0x%X),' % (name, base, size))
     a(")")
     a("")
-    shared = [r["name"] for r in m["regions"] if len(r["accessors"]) >= 3]
-    a("# 三方共享区 —— 归并工具据此判定真实共享")
-    a("SHARED_REGIONS = %r" % (tuple(shared),))
-    a("")
     handoff = [r["name"] for r in m["regions"] if len(r["accessors"]) >= 2]
     a("# 任意两源都可能在此交接的区域（accessor >= 2）。validate 用它回答"
       '"这批 trace')
     a("# 里到底有没有跨源交接\"—— 不同的源两两配对，交接区不是同一个：host+NPU 在")
-    a("# shared_buffer / npu_work，host+Vortex 在 vortex_bar。只盯 SHARED_REGIONS")
-    a("# 会把合法的两源跑法误判成无信息量。")
+    a("# shared_buffer / npu_work，host+Vortex 在 vortex_bar。当前地址宽度约束下")
+    a("# 不存在三方以同一物理地址直连共享的区域。")
     a("HANDOFF_REGIONS = %r" % (tuple(handoff),))
     a("")
     a("")
@@ -361,14 +351,6 @@ def gen_py(m):
     a("def is_traced(addr):")
     a('    """HETTRACE_FILTER=dram 时该地址是否会被记录。C++ 侧 IsTraced() 的镜像。"""')
     a("    for _name, base, size in TRACE_WINDOWS:")
-    a("        if base <= addr < base + size:")
-    a("            return True")
-    a("    return False")
-    a("")
-    a("")
-    a("def is_shared(addr):")
-    a("    for name in SHARED_REGIONS:")
-    a("        base, size, _kind, _acc = REGIONS[name]")
     a("        if base <= addr < base + size:")
     a("            return True")
     a("    return False")

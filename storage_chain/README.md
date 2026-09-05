@@ -16,7 +16,7 @@ XPU/gem5 → 统一 memory-side AXI4 HETTrace
 ## 运行
 
 ```bash
-make -C storage_chain test
+make -C storage_chain test lint
 # 或在仓库根目录
 make test-storage-chain
 ```

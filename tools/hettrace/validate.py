@@ -903,10 +903,10 @@ def _cross_source_checks(summaries, require_heterogeneous=True):
     # 1. 至少有一个交接区被两个源真实触及，否则这几条 trace 互不相关，
     #    归并出来也看不到任何交接行为。
     #
-    #    这里遍历的是 HANDOFF_REGIONS（accessor >= 2）而不是 SHARED_REGIONS
-    #    （accessor >= 3）：源两两配对时交接区并不是同一个 —— host+CoralNPU 在
-    #    shared_buffer / npu_work 交接，host+Vortex 在 vortex_bar 交接。只盯三方
-    #    共享区会把"host + Vortex 跑一遍"这种合法跑法误判成无信息量。
+    #    这里遍历 HANDOFF_REGIONS（accessor >= 2）。源两两配对时交接区并不是
+    #    同一个：host+CoralNPU 在 shared_buffer / npu_work 交接，host+Vortex
+    #    在 vortex_bar 交接。受 NPU 32 位地址与 Vortex BAR 位置约束，当前没有
+    #    三方以同一物理地址直连共享的区域。
     found = []
     for reg in addrmap.HANDOFF_REGIONS:
         touchers = [s.name for s in live if s.regions.get(reg, 0) > 0]

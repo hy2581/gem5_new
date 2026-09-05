@@ -164,6 +164,7 @@ kernel 和外部 `hbm_sim`。
 make check
 make test-storage-chain
 make test-memsim-smoke
+make preflight
 gem5int/tests/run_het.sh
 gem5int/tests/run_vortex_shared.sh
 gem5int/tests/run_three_source.sh
@@ -175,6 +176,7 @@ make benchmark-llm-memory
 | `make check` | 地址生成物、Python 工具、C++ writer |
 | `make test-storage-chain` | RTL 透明 AXI 边界、字段与反压 |
 | `make test-memsim-smoke` | 16 B 粒度小型 trace→外部 hbm_sim→请求/字节/response 对齐 |
+| `make preflight` | 命令、固定上游 revision 和全流程构建产物是否齐备 |
 | `run_het.sh` | host↔CoralNPU 功能交接 |
 | `run_vortex_shared.sh` | host runtime↔CP DMA↔Vortex core 与统一 trace |
 | `run_three_source.sh` | 同一 gem5 中三源功能、分类、共享区、AXI 因果和投影守恒 |
@@ -253,11 +255,10 @@ workloads/llm_memory/run.sh \
 
 # 8. 已验证基线
 
-2026-09-05 的快速回归以 16 B 粒度生成 596 个请求，外部 HBM4 配置完成 596/596，response ID
-全部与 mapping 对齐；零值替身的 `data_mismatches=0` 不代表原 AXI 数据正确。对一份已有三源
-trace 重新执行精确粒度投影得到
-50,487 个请求、731,880 B，逐行 payload/mask 长度与 mapping 一致。该结果证明功能、追踪、
-降级和外部响应守恒链路可复现，不构成硬件绝对性能或应用闭环性能结论。
+当前测试矩阵、精确计数、三源 trace 和真实外部 HBM4 重放结果统一维护在
+[05-validation-report.md](05-validation-report.md)。2026-09-05 基线的工具、writer、RTL、
+两源、三源、smoke 与完整 50,487 请求重放均通过。报告中的时序只适用于固定请求流，
+不构成硬件绝对性能或应用闭环性能结论。
 
 # 9. 清理与日常维护
 
@@ -281,3 +282,7 @@ make clean
 该目标不会清理四棵上游源码树的 build 目录，也不会删除验收脚本明确保留在仓库外的 trace/
 `m5out`。复现实验时应同时保存 HETTrace manifest、转换参数、mapping CSV、`hbm_sim` 配置和
 response CSV；只保存最终统计不足以重放结果。
+
+仓库只持久化 [当前版本验证报告](05-validation-report.md)。benchmark 每次运行生成的
+`validate.txt`、`stats.txt`、`hbm_sim.txt` 和 `summary.md` 必须与同目录 trace/CSV 一起看，
+不应脱离输入另存为“最新结果”。

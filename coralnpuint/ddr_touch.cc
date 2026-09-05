@@ -26,7 +26,7 @@
 
 namespace {
 
-// addrmap.json: regions.shared_buffer，accessors = host / vortex / coralnpu。
+// addrmap.json: regions.shared_buffer，accessors = host / coralnpu。
 // in / out 各 4 KiB 且不重叠，这样归并 trace 时能靠地址区间区分谁读谁写。
 volatile uint32_t* const kIn  = reinterpret_cast<volatile uint32_t*>(0x90000000u);
 volatile uint32_t* const kOut = reinterpret_cast<volatile uint32_t*>(0x90001000u);

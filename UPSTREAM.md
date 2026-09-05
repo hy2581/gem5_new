@@ -58,7 +58,7 @@ interconnect 上；三源分类、请求/响应关联和 HETTrace v2 写出都�
 | Python（构建 gem5 用） | 3.12.3（系统 `/usr/bin/python3`，`gem5.opt` 链的是它的 `libpython`） |
 | Python（跑本项目工具） | 3.8.20 也可 —— 工具只用标准库 |
 | SCons | 在 `$GEM5_HOME/.venv/bin/scons`，**不在 PATH 上** |
-| Bazel | 8.6.0（由 CoralNPU 的 `.bazelversion` 钉住，bazelisk 按需下载） |
+| Bazel | CoralNPU 树内为 8.6.0（由 `.bazelversion` 钉住；树外 bazelisk 默认版本不作为构建口径） |
 | CMake / generator | 3.28.3 / Unix Makefiles；Ninja 不是必需项，`hbm_sim` 要求 C++20 |
 | Verilator | 5.020 |
 | Vortex LLVM 工具链 | `TOOLCHAIN_REV=v3.0`，`OSVERSION=ubuntu/focal`，装在 `$HOME/tools` |

@@ -77,8 +77,8 @@ static void TestHeaderAndRoundTrip() {
         CHECK(w.Open(kSrcVortex, "vortex", kLevelPostLlc,
                      kClockPeriodTicks_vortex, /*axi_data_bytes=*/64),
               "Open 应成功");
-        w.Emit(1000, kSharedBufferBase, 64, kRead, 7);
-        w.Emit(2000, kSharedBufferBase + 64, 64, kWrite, 7);
+        w.Emit(1000, kVortexBarBase, 64, kRead, 7);
+        w.Emit(2000, kVortexBarBase + 64, 64, kWrite, 7);
         w.Emit(3000, kVortexVramBase, 32, kRead, 9);
     }  // 析构应 Flush + 写 meta
 
@@ -100,7 +100,7 @@ static void TestHeaderAndRoundTrip() {
 
     CHECK(recs.size() == 3, "应有 3 条记录");
     if (recs.size() == 3) {
-        CHECK(recs[0].tick == 1000 && recs[0].addr == kSharedBufferBase &&
+        CHECK(recs[0].tick == 1000 && recs[0].addr == kVortexBarBase &&
                   recs[0].size == 64 && recs[0].op == kRead &&
                   recs[0].ctx == 7 && recs[0].seq == 0,
               "记录 0 字段应往返一致");
@@ -480,10 +480,13 @@ static void TestFlushAcrossBuffer() {
 }
 
 static void TestAddrMapSanity() {
-    // shared_buffer 必须在 DRAM 窗口内且三方可达，否则整个工程无意义。
+    // shared_buffer 是 host↔NPU 交接区；Vortex 只能经 4 GiB 以上 BAR
+    // 与 host 交接，当前不存在三方以同一物理地址直连共享的区域。
     CHECK(IsDram(kSharedBufferBase), "shared_buffer 应在 DRAM 窗口内");
-    CHECK(IsShared(kSharedBufferBase), "IsShared 应识别 shared_buffer");
-    CHECK(!IsShared(kNpuWorkBase), "npu_work 不应被判为共享");
+    CHECK(kSharedBufferBase + kSharedBufferSize <= (1ull << kNpuAddrBits),
+          "shared_buffer 必须在 NPU 32 位地址范围内");
+    CHECK(kVortexBarBase >= (1ull << kNpuAddrBits),
+          "vortex_bar 应位于 NPU 地址范围之外");
     // CoralNPU 只有 32 位地址；所有 DRAM 区域必须在 4GiB 以内。
     // 注意这里用 kNpuAddrBits 而不是整张图的宽度：vortex_bar 在 4GiB 之上，
     // 它是合法的（host 与 Vortex 够得到），只是 NPU 够不到。

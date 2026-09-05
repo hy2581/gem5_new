@@ -20,7 +20,7 @@ Python 运行环境限制仍保留常量，若两边漂移，trace 会出现 `un
 | `vortex_cp` | `0x20000000` | 512 B | host→Vortex command processor | `VortexGPGPU.pio` |
 | `npu_pio` | `0x30000000` | 4 KiB | host→CoralNPU registers | `CoralNPU.pio` |
 | `host_heap` | `0x80000000` | 256 MiB | host 代码、堆和栈 | `host_mem` |
-| `shared_buffer` | `0x90000000` | 256 MiB | host、NPU 显式交接 | `unified_mem` |
+| `shared_buffer` | `0x90000000` | 256 MiB | host、CoralNPU 显式交接 | `unified_mem` |
 | `vortex_vram` | `0xa0000000` | 256 MiB | Vortex 设备局部诊断视图 | 不单独声明 |
 | `npu_work` | `0xb0000000` | 256 MiB | host、NPU 工作区 | `unified_mem` |
 | `npu_mailbox` | `0xc0000000` | 16 B | CoralNPU 内部 mailbox | device |
@@ -35,6 +35,7 @@ Python 运行环境限制仍保留常量，若两边漂移，trace 会出现 `un
 CoralNPU AXI 地址为 32 位，只把 `[0x80000000, 0xc0000000)` 判为 DDR，不能表达 4 GiB 以上
 的 Vortex BAR。Vortex runtime 又固定使用 `PIN_BASE_ADDR=0x100000000` 和 4 GiB pin region。
 所以 NPU 与 Vortex 不能直接共享同一物理字节，三源 workload 由 host 分别完成交接。
+当前地址图不存在三方以同一物理地址直连共享的区域。
 
 每个地址只能有一个 responder。异构配置由 `host_mem` 响应 `host_heap`，由
 `UnifiedTimingMemory` 响应 `shared_buffer`、`npu_work` 和启用时的 `vortex_bar`；Vortex BAR

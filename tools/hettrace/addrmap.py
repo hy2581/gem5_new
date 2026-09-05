@@ -31,7 +31,7 @@ REGIONS = {
     "vortex_cp": (0x20000000, 0x200, "mmio", ('host',)),
     "npu_pio": (0x30000000, 0x1000, "mmio", ('host',)),
     "host_heap": (0x80000000, 0x10000000, "dram", ('host',)),
-    "shared_buffer": (0x90000000, 0x10000000, "dram", ('host', 'vortex', 'coralnpu')),
+    "shared_buffer": (0x90000000, 0x10000000, "dram", ('host', 'coralnpu')),
     "vortex_vram": (0xA0000000, 0x10000000, "dram", ('vortex',)),
     "npu_work": (0xB0000000, 0x10000000, "dram", ('host', 'coralnpu')),
     "npu_mailbox": (0xC0000000, 0x10, "mmio", ('host', 'coralnpu')),
@@ -46,13 +46,10 @@ TRACE_WINDOWS = (
     ("vortex_bar", 0x100000000, 0x100000000),
 )
 
-# 三方共享区 —— 归并工具据此判定真实共享
-SHARED_REGIONS = ('shared_buffer',)
-
 # 任意两源都可能在此交接的区域（accessor >= 2）。validate 用它回答"这批 trace
 # 里到底有没有跨源交接"—— 不同的源两两配对，交接区不是同一个：host+NPU 在
-# shared_buffer / npu_work，host+Vortex 在 vortex_bar。只盯 SHARED_REGIONS
-# 会把合法的两源跑法误判成无信息量。
+# shared_buffer / npu_work，host+Vortex 在 vortex_bar。当前地址宽度约束下
+# 不存在三方以同一物理地址直连共享的区域。
 HANDOFF_REGIONS = ('shared_buffer', 'npu_work', 'npu_mailbox', 'vortex_bar')
 
 
@@ -72,14 +69,6 @@ def is_dram(addr):
 def is_traced(addr):
     """HETTRACE_FILTER=dram 时该地址是否会被记录。C++ 侧 IsTraced() 的镜像。"""
     for _name, base, size in TRACE_WINDOWS:
-        if base <= addr < base + size:
-            return True
-    return False
-
-
-def is_shared(addr):
-    for name in SHARED_REGIONS:
-        base, size, _kind, _acc = REGIONS[name]
         if base <= addr < base + size:
             return True
     return False
