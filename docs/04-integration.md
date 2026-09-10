@@ -4,6 +4,9 @@
 [UPSTREAM.md](../UPSTREAM.md)。前三棵提供功能执行和 trace 产生端；`mem_sim/hbm_sim` 是独立、
 只读消费 trace 的存储时序端，项目不会给它打在线回调补丁。
 
+从零获取四棵源码、公开 gem5 SHA 修正与 mem_sim 离线包导入见
+[构建运行详解](08-build-run.md)。新增设备的完整步骤见[XPU 接入流程](11-xpu-integration.md)。
+
 ## 职责与安装内容
 
 | 树 | 环境变量 | 本项目行为 |
@@ -83,6 +86,10 @@ trace ABI → timing_feedback.patch → axi_transactions.patch
 
 CoralNPU 的 base/async wrapper 补丁也有顺序，提供非阻塞 AXI issue/completion seam，使真实
 READY/VALID、ID、WSTRB 和 RESP 可由 gem5 驱动。不要手工重复应用单个 hunk。
+
+CoralNPU 共享库显式链接 `libatomic`，并用 `-Wl,-z,defs` 在链接阶段拒绝未解析符号；
+这是干净 Clang/Verilator 构建后 `dlopen` 不应依赖宿主进程碰巧提供原子操作符号的保证。
+`coralnpuint/tests/run_smoke.sh` 用纯 C 调用 ABI，应在新库构建后先运行一次。
 
 ## 补丁打不上
 

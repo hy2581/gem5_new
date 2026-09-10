@@ -81,12 +81,16 @@ cc_library(
 # linkshared 的 cc_binary 是 CoralNPU 自己导出 .so 的既有做法
 # （见 //hw_sim:libcoralnpu_simulator.so），照抄以免踩到不同的 PIC 配置。
 #
-# 两个 linkopts 都不是可选的，理由写在 coralnpu_gem5.map 里：本库静态链进了一整套
+# 版本脚本与符号绑定选项的理由写在 coralnpu_gem5.map 里：本库静态链进了一整套
 # SystemC，而 gem5.opt 里也有一套，不隔离的话进程退出时会段错误。
 PLUGIN_LINKOPTS = [
     "-Wl,--version-script=$(location coralnpu_gem5.map)",
     # 本库内部的引用优先绑本库自己的定义，而不是全局作用域里 gem5.opt 的同名符号。
     "-Wl,-Bsymbolic",
+    # Clang/Verilator's atomic lock-free queries need libatomic on x86-64 too.
+    # A shared-library link otherwise succeeds but standalone dlopen can fail.
+    "-latomic",
+    "-Wl,-z,defs",
 ]
 
 cc_binary(

@@ -9,7 +9,7 @@ import json
 import math
 import statistics
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -18,6 +18,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("manifest", type=Path, help="benchmark.json")
     parser.add_argument("mapping", type=Path, help="convert --preset memsim map CSV")
     parser.add_argument("responses", type=Path, help="hbm_sim HostResponse CSV")
+    parser.add_argument("--allow-uninitialized", action="store_true",
+                        help="仅用于无初始内存镜像的真实 trace；记录并容忍 uninitialized_data")
     return parser.parse_args()
 
 
@@ -156,7 +158,8 @@ def main() -> int:
             failures.append("id=%d mapping size=%d 非正" % (request_id, mapped_size))
 
         expected_type = "Write" if mapped["chan"] in {"AW", "W"} else "Read"
-        if response["status"] != "ok":
+        allowed_statuses = {"ok", "uninitialized_data"} if args.allow_uninitialized else {"ok"}
+        if response["status"] not in allowed_statuses:
             failures.append("id=%d status=%s" % (request_id, response["status"]))
         if arrival < mapped_cycle:
             failures.append(
@@ -165,6 +168,8 @@ def main() -> int:
             )
         if completion - arrival != latency:
             failures.append("id=%d latency 字段与完成周期不一致" % request_id)
+        if completion < arrival or latency < 0:
+            failures.append("id=%d completion/latency 违反因果顺序" % request_id)
         if mapped_addr != response_addr:
             failures.append("id=%d 地址不一致" % request_id)
         if response["type"] != expected_type:
@@ -236,6 +241,11 @@ def main() -> int:
         "不校验原始 AXI 数据。"
         % manifest.get("projection_payload_semantics", "unspecified")
     )
+    statuses = Counter(row["status"] for row in response_rows)
+    print("状态计数：%s。" % ", ".join("%s=%d" % item for item in sorted(statuses.items())))
+    if args.allow_uninitialized:
+        print("本次显式允许 uninitialized_data：只通过请求/时序审计，"
+              "不代表离线初始数据已完整提供；其他错误状态仍会失败。")
     print()
     print("| 流量 | 请求数 | min | mean | p50 | p95 | max |")
     print("|---|---:|---:|---:|---:|---:|---:|")
@@ -247,9 +257,20 @@ def main() -> int:
             print(latency_row(request_type, by_type[request_type]))
     print()
     print(
-        "hbm_sim 前端串行注入等待：mean %.1f cycle，max %d cycle。"
+        "hbm_sim 前端按序提交等待：mean %.1f cycle，max %d cycle。"
         % (statistics.fmean(injection_delays), max(injection_delays))
     )
+    print(
+        "从请求计划周期到完成的平均延迟：%.1f cycle（提交等待 + response latency）。"
+        % statistics.fmean(
+            int(responses[rid]["completion_cycle"]) - int(mapping[rid]["cycle"])
+            for rid in sorted(mapping)
+        )
+    )
+    if all("forwarded" in row for row in response_rows):
+        forwarded = [row for row in response_rows if row["forwarded"].lower() == "true"]
+        print("写缓冲转发响应：%d / %d；低延迟不能直接解释为 DRAM 阵列访问更快。"
+              % (len(forwarded), len(response_rows)))
     print()
     print(
         "延迟单位是 hbm_sim cycle。该结果是固定到达流的 open-loop 存储时序："

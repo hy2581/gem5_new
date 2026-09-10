@@ -2,7 +2,8 @@
 
 本项目把 gem5 中 host CPU、Vortex GPU 和 CoralNPU 的 memory-side 流量放到同一个互连观察点，
 写成统一的 **HETTrace v2 AXI4 五通道记录**，再离线投影给外部
-[`mem_sim/hbm_sim`](https://github.com/GuXing25/mem_sim) 做存储控制器与 DRAM 时序仿真。
+`mem_sim/hbm_sim` 做存储控制器与 DRAM 时序仿真。该上游当前匿名不可访问，
+请使用[固定版本源码包导入流程](UPSTREAM.md#mem_sim-无登录获取)。
 
 ```text
 host CPU ─┐
@@ -32,6 +33,10 @@ tokens/s 或应用级闭环加速比。
 Vortex 的 `third_party/ramulator` 仍是 SimX 自身依赖，不能删除；它不是本项目的存储时序后端。
 
 ## 快速检查
+
+首次安装先读[四棵外部源码的获取、构建与运行](docs/08-build-run.md)。gem5 的公开基线已修正为
+官方 `v25.1.0.1` / `c8222cc67a399bfc01e8658dd14b30d5bfd634f9`；原 `2721ed...` 是历史私有
+fork 提交。下载与预检统一读取 [upstream.lock.json](upstream.lock.json)。
 
 ```bash
 source scripts/native_env.sh
@@ -75,10 +80,15 @@ make benchmark-llm-memory
 ## 文档
 
 - [项目手册](docs/USER_MANUAL.md)：项目边界、环境、构建、运行、维护和结果解释；
+- [详细架构](docs/07-architecture.md)：层级、模块、状态所有权、端口交互与事件运行机制；
+- [构建运行详解](docs/08-build-run.md)：四棵源码逐项添加命令、工具链、产物、完整重放及排错；
+- [实验设计与结果分析](docs/09-experiments.md)：实测参数对照、指标定义、现象分析和优化空间；
+- [多设备协同](docs/10-multi-device.md)：Host 编排、Vortex/NPU 控制、数据交接与同步；
+- [新增 XPU 接入](docs/11-xpu-integration.md)：契约、ABI、SimObject、地址、分类与逐级验收；
 - [地址图](docs/01-address-map.md)：统一物理地址及硬约束；
 - [HETTrace v2 格式](docs/02-trace-format.md)：字段、层级和投影；
 - [结论边界](docs/03-limitations.md)：open-loop 能与不能说明什么；
 - [上游集成](docs/04-integration.md)：安装内容和补丁维护；
 - [验证报告](docs/05-validation-report.md)：当前版本的测试矩阵、三源 trace 与 HBM 重放结果；
 - [RTL AXI 边界](docs/06-storage-chain-plan.md)：参考模块与限制；
-- [固定上游版本](UPSTREAM.md)：已验证的外部源码 commit 与工具版本。
+- [固定上游版本](UPSTREAM.md)：公开 gem5 commit、历史基线、mem_sim 访问与离线交付。

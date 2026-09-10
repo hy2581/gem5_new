@@ -4,7 +4,7 @@
 # CoralNPU 用 bazel、Vortex 与 mem_sim 各用自己的构建系统。要构建它们
 # 见项目手册 docs/USER_MANUAL.md；补丁与实现细节见 docs/04-integration.md。
 #
-# 这里能做的是"不需要任何仿真器就能验的部分"：生成物是否与 addrmap.json 同步、两套
+# 这里能做的是"不需要任何仿真器就能验的部分"：生成物是否与 addrmap.json 同步、各项
 # 自测是否过。CI 应该先跑 `make check`，因为它快且能挡掉最隐晦的一类错误。
 
 PROJ    := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
@@ -12,7 +12,7 @@ PYTHON  ?= python3
 CXX     ?= g++
 BUILD   := build
 
-.PHONY: all check check-addrmap addrmap test test-tools test-writer \
+.PHONY: all check check-addrmap addrmap test test-tools test-writer test-workflow \
         test-storage-chain test-memsim-smoke \
         benchmark-llm-memory preflight \
         install install-gem5 install-vortex \
@@ -21,10 +21,10 @@ BUILD   := build
 all: check
 
 help:
-	@echo "make check          - addrmap 同步性 + 两套自测（不需要仿真器）"
+	@echo "make check          - addrmap + 工具/writer/源码获取自测（不需要仿真器）"
 	@echo "make addrmap        - 从 addrmap.json 重新生成 C++/Python 侧的地址表"
 	@echo "make check-addrmap  - 只校验生成物是否过期，不写文件"
-	@echo "make test           - test-tools + test-writer"
+	@echo "make test           - test-tools + test-writer + test-workflow"
 	@echo "make test-storage-chain - 透明 AXI4 边界 + trace/checker RTL 回归"
 	@echo "make test-memsim-smoke - 小型 HETTrace -> 外部 hbm_sim 端到端回归"
 	@echo "make benchmark-llm-memory - 合成 decoder-LLM 访存流 -> 外部 mem_sim/hbm_sim"
@@ -46,7 +46,10 @@ check-addrmap:
 	@$(PYTHON) scripts/gen_addrmap.py --check
 
 # ---- 自测 ------------------------------------------------------------------
-test: test-tools test-writer
+test: test-tools test-writer test-workflow
+
+test-workflow:
+	@$(PYTHON) tools/tests/test_workflow.py
 
 test-storage-chain:
 	$(MAKE) -C storage_chain test lint
